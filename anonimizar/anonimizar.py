@@ -135,6 +135,9 @@ RE_TOKEN_ARN = re.compile(r"(?<=[/:_.])([0-9A-Za-z]{16,})(?=$|[/:_.-])")
 RE_COSTO = re.compile(r"(\$\s?)(\d(?:[\d,]*\d)?(?:\.\d+)?)|(?<![\w.,])(\d(?:[\d,]*\d)?(?:\.\d+)?)(\s?USD\b)")
 # \w acotado: sin tope es cuadrático en secuencias largas de letras.
 RE_COSTO_CLAVE = re.compile(r"([\"']?)(\w{0,64}(?:usd|cost|costo)\w{0,64})\1(\s*:\s*)(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+# Precio unitario que las reglas de la fase 3 citan ("precio 0.088 USD/GB-mes", "0.11 → 0.088 USD/GB-mes"):
+# con los GiB u horas del mismo texto permite recalcular el costo, así que se oculta si costs no es exact.
+RE_PRECIO_UNITARIO = re.compile(r"(?<![\w.,])\d+(?:\.\d+)?(?:\s*→\s*\d+(?:\.\d+)?)?\s?USD/(GB-mes|hora)\b")
 RE_MENSUAL = re.compile(r"^\s*(?:USD\s*)?(?:/\s*mes|/\s*month|/\s*mo\b|al mes|por mes|mensual|per month)",
                         re.IGNORECASE)
 RE_CLAVE_COSTO = re.compile(r"usd|cost|costo", re.IGNORECASE)
@@ -616,6 +619,8 @@ class Anonimizador:
                 return m.group(0)
             return f"{m.group(1)}{m.group(2)}{m.group(1)}{m.group(3)}{r[1]}"
 
+        if self.costos != "exact":
+            texto = RE_PRECIO_UNITARIO.sub(lambda m: f"USD/{m.group(1)} de lista", texto)
         texto = RE_COSTO.sub(sub, texto)
         return RE_COSTO_CLAVE.sub(sub_clave, texto)
 

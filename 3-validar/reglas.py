@@ -9,15 +9,45 @@ Uso: from reglas import aplicar; findings = aplicar(inventory)
 
 from datetime import datetime, timezone
 
+from common.precios import CONSULTAS, precio
 from hallazgos import hallazgo, parsear_fecha, severidad_por_costo
+
+
+def _precio(ctx, region, clave, estatico):
+    """(usd por unidad, fuente): el de la API para la región si la corrida lo trae; si no, el de respaldo."""
+    return precio(ctx.get("precios"), region, clave, estatico)
+
+
+def _texto_precio(usd, unidad, fuente):
+    return f"precio {usd:g} USD/{unidad} ({'Price List API' if fuente == 'pricing_api' else 'estimado us-east-1'})"
+
+
+def precios_necesarios(inventory):
+    """{región: {claves de common.precios}} que las reglas van a pedir para este inventario."""
+    pedidos = {}
+    for r in inventory.get("resources", []):
+        a, reg = r.get("attrs") or {}, r.get("region")
+        if not reg or reg == "global":
+            continue
+        claves = pedidos.setdefault(reg, set())
+        if r.get("type") == "volume" and r.get("service") in ("ebs", "ec2"):
+            claves.update({f"ebs_gb_mes:{a.get('volume_type') or 'gp2'}", "ebs_gb_mes:gp2", "ebs_gb_mes:gp3"})
+        elif r.get("type") == "snapshot":
+            claves.add("snapshot_gb_mes")
+        elif r.get("type") == "elastic_ip":
+            claves.add("ipv4_ociosa_hora")
+    # Un volume_type que common.precios no sabe consultar (uno nuevo) usa el precio de respaldo de la regla.
+    pedidos = {reg: {k for k in c if k in CONSULTAS} for reg, c in pedidos.items()}
+    return {reg: c for reg, c in pedidos.items() if c}
 
 FUENTE = "regla"
 
-# Precios de referencia us-east-1 (USD por GB-mes). Son estimados, no una factura.
+# Precios de respaldo (us-east-1, USD) para cuando la corrida no trae precios.json: las reglas usan el precio
+# de la Price List API de la región del recurso (ctx["precios"], ver common/precios.py) y marcan la fuente.
 PRECIO_EBS_GB = {"gp3": 0.08, "gp2": 0.10, "io1": 0.125, "io2": 0.125, "st1": 0.045, "sc1": 0.015, "standard": 0.05}
 PRECIO_SNAPSHOT_GB = 0.05
-PRECIO_EIP_MES = 3.60  # $0.005/hora
-AHORRO_GP2_A_GP3_GB = PRECIO_EBS_GB["gp2"] - PRECIO_EBS_GB["gp3"]
+PRECIO_IPV4_HORA = 0.005
+HORAS_MES = 730
 
 DIAS_SNAPSHOT_VIEJO = 180
 DIAS_EC2_DETENIDA = 30
@@ -44,11 +74,14 @@ def regla_ebs_sin_adjuntar(recursos, ctx):
         if _es(r, {"ebs", "ec2"}, "volume") and r.get("state") == "available":
             a = _attrs(r)
             gb = a.get("size_gb") or 0
-            usd = gb * PRECIO_EBS_GB.get(a.get("volume_type"), PRECIO_EBS_GB["gp2"])
+            tipo = a.get("volume_type") or "gp2"
+            unit, fuente = _precio(ctx, r["region"], f"ebs_gb_mes:{tipo}", PRECIO_EBS_GB.get(tipo, PRECIO_EBS_GB["gp2"]))
+            usd = gb * unit
+            iops = " (sin las IOPS provisionadas: el costo real es mayor)" if tipo in ("io1", "io2") else ""
             out.append(hallazgo("desperdicio", severidad_por_costo(usd, "media"), r["account_id"], r["region"], r["id"],
                                 "Volumen EBS sin adjuntar",
-                                f"{gb} GiB {a.get('volume_type')}, estado available. Snapshot y borrar si no se usa.",
-                                usd, FUENTE))
+                                f"{gb} GiB {tipo}, estado available. Snapshot y borrar si no se usa. "
+                                f"{_texto_precio(unit, 'GB-mes', fuente)}{iops}.", usd, FUENTE, price_source=fuente))
     return out
 
 
@@ -62,9 +95,12 @@ def regla_eip_sin_asociar(recursos, ctx):
         if asociada is None:
             asociada = bool(a.get("association_id") or a.get("instance_id") or a.get("network_interface_id"))
         if not asociada and r.get("state") != "associated":
+            hora, fuente = _precio(ctx, r["region"], "ipv4_ociosa_hora", PRECIO_IPV4_HORA)
             out.append(hallazgo("desperdicio", "media", r["account_id"], r["region"], r["id"],
-                                "Elastic IP sin asociar", f"IP {a.get('public_ip')} reservada sin uso; se cobra igual.",
-                                PRECIO_EIP_MES, FUENTE))
+                                "Elastic IP sin asociar",
+                                f"IP {a.get('public_ip')} reservada sin uso; se cobra igual. "
+                                f"{_texto_precio(hora, 'hora', fuente)} × {HORAS_MES} h.",
+                                hora * HORAS_MES, FUENTE, price_source=fuente))
     return out
 
 
@@ -83,12 +119,14 @@ def regla_snapshots_viejos(recursos, ctx):
         dias = (ctx["ahora"] - fecha).days
         if dias > DIAS_SNAPSHOT_VIEJO:
             gb = a.get("size_gb") or 0
-            usd = gb * PRECIO_SNAPSHOT_GB  # tope: los snapshots son incrementales
+            unit, fuente = _precio(ctx, r["region"], "snapshot_gb_mes", PRECIO_SNAPSHOT_GB)
+            usd = gb * unit  # tope: los snapshots son incrementales (se cobra lo cambiado, no el tamaño del volumen)
             origen = ", ".join(r.get("relations", {}).get("attached_to", [])) or "sin volumen origen"
             out.append(hallazgo("desperdicio", severidad_por_costo(usd, "baja"), r["account_id"], r["region"], r["id"],
                                 f"Snapshot EBS de más de {DIAS_SNAPSHOT_VIEJO} días",
-                                f"{dias} días, {gb} GiB ({origen}). Costo máximo estimado; revisar si sigue siendo necesario.",
-                                usd, FUENTE))
+                                f"{dias} días, {gb} GiB ({origen}). Costo máximo (los snapshots son incrementales); "
+                                f"revisar si sigue siendo necesario. {_texto_precio(unit, 'GB-mes', fuente)}.",
+                                usd, FUENTE, price_source=fuente))
     return out
 
 
@@ -183,9 +221,16 @@ def regla_gp2(recursos, ctx):
         a = _attrs(r)
         if _es(r, {"ebs", "ec2"}, "volume") and a.get("volume_type") == "gp2":
             gb = a.get("size_gb") or 0
-            usd = gb * AHORRO_GP2_A_GP3_GB
+            gp2, f2 = _precio(ctx, r["region"], "ebs_gb_mes:gp2", PRECIO_EBS_GB["gp2"])
+            gp3, f3 = _precio(ctx, r["region"], "ebs_gb_mes:gp3", PRECIO_EBS_GB["gp3"])
+            fuente = "pricing_api" if f2 == f3 == "pricing_api" else "static_estimate"
+            if fuente == "static_estimate":  # no mezclar un precio de la región con uno de us-east-1
+                gp2, gp3 = PRECIO_EBS_GB["gp2"], PRECIO_EBS_GB["gp3"]
+            usd = gb * max(gp2 - gp3, 0)
             out.append(hallazgo("costo", "baja", r["account_id"], r["region"], r["id"], "Volumen gp2 migrable a gp3",
-                                f"{gb} GiB gp2 → gp3 ahorra ~20% sin downtime (ahorro estimado).", usd, FUENTE))
+                                f"{gb} GiB gp2 → gp3 sin downtime: {gp2:g} → {gp3:g} USD/GB-mes "
+                                f"({'Price List API' if fuente == 'pricing_api' else 'estimado us-east-1'}).",
+                                usd, FUENTE, price_source=fuente))
     return out
 
 
@@ -314,10 +359,11 @@ REGLAS = [
 ]
 
 
-def aplicar(inventory):
-    """Corre todas las reglas. La fecha de referencia es la del inventario (reproducible)."""
+def aplicar(inventory, precios=None):
+    """Corre todas las reglas. La fecha de referencia es la del inventario (reproducible). `precios` es
+    {región: {clave: precio}} de common.precios (o None: las reglas usan sus estimados de respaldo)."""
     ahora = parsear_fecha(inventory.get("generated_at")) or datetime.now(timezone.utc)
-    ctx = {"ahora": ahora}
+    ctx = {"ahora": ahora, "precios": precios or {}}
     recursos = inventory.get("resources", [])
     findings = []
     for regla in REGLAS:

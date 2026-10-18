@@ -193,3 +193,17 @@ def test_org_alias_de_la_corrida_se_trata_como_marca(tmp_path):
 def test_run_id_se_conserva():
     a = an.Anonimizador(an.Mapeo(), ["acme"], "rounded")
     assert a.json({"run": {"run_id": "2026-10-18T073802Z"}})["run"]["run_id"] == "2026-10-18T073802Z"
+
+
+@pytest.mark.parametrize("costos", ["rounded", "percent"])
+def test_precio_unitario_de_las_reglas_se_oculta(costos):
+    a = an.Anonimizador(an.Mapeo(), ["acme"], costos, total_usd=1000.0, meses=1)
+    t = a.texto("100 GiB gp2 → gp3 sin downtime: 0.11 → 0.088 USD/GB-mes (Price List API). "
+                "precio 0.005 USD/hora (Price List API) × 730 h.")
+    assert "0.088" not in t and "0.11" not in t and "0.005" not in t
+    assert "USD/GB-mes de lista" in t and "USD/hora de lista" in t
+
+
+def test_precio_unitario_intacto_con_costos_exactos():
+    a = an.Anonimizador(an.Mapeo(), ["acme"], "exact")
+    assert "0.11 → 0.088 USD/GB-mes" in a.texto("0.11 → 0.088 USD/GB-mes")

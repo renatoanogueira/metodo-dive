@@ -17,7 +17,8 @@ y `source` (aws-doctor | cruce-billing | regla).
    contexto de negocio que no estén ahí. Si algo no se puede concluir con los datos, dilo así: "no hay datos para…".
 2. Cada afirmación cita al menos un `id` de finding (ej. `F012`) y, cuando exista, el `resource_id` y el `account_id`.
 3. No inventes cifras. Los montos salen de `monthly_usd`; si es `null`, escribe "sin estimado". Al sumar, di qué IDs sumaste.
-4. `monthly_usd` es un **estimado** (precios de us-east-1, o promedio mensual del billing). Algunos findings se solapan
+4. `monthly_usd` es un **estimado**: mira `price_source` (`pricing_api` = precio on-demand de la región,
+   `static_estimate` = precio de us-east-1, `ce_actual` = promedio mensual del billing) y `confidence`. Algunos findings se solapan
    (ej. un volumen gp2 sin adjuntar aparece como desperdicio y como migración a gp3): no los sumes dos veces.
 5. Un finding `cruce-billing` de "se cobra pero no está inventariado" puede ser un hueco del inventario (colector que
    falló o no cubre ese recurso), no necesariamente un recurso olvidado. Lee el `detail` antes de clasificarlo.

@@ -13,7 +13,8 @@ Cada fase lee el archivo de la anterior y escribe el suyo en `salida/<corrida>/`
   "currency": "USD",
   "config": {"billing_months": 6, "threshold_usd": 0.01, "include_accounts": [], "exclude_accounts": [], "access_mode": "sso"},
   "flags": {"inventariar": {"solo": null, "sin_cobertura": false},
-            "validar": {"sin_doctor": false, "aws_doctor_version": "aws-doctor version 2.21.1"}}
+            "validar": {"sin_doctor": false, "aws_doctor_version": "aws-doctor version 2.21.1",
+                        "precios": "pricing_api"}}
 }
 ```
 
@@ -127,8 +128,11 @@ Campos v2 (aditivos) de cada finding:
 - `rule_id`: de dónde salió: `regla.<nombre>`, `aws-doctor.<categoría>` o `cruce.<tipo>`.
 - `issue_id`: el problema canónico. Fuentes distintas que detectan lo mismo comparten `issue_id` (ej. `regla.ebs_sin_adjuntar` y `aws-doctor.unused_ebs_volumes` → `ebs.unattached`).
 - `fingerprint`: `sha256(issue_id|account_id|region|resource_id|discriminador)[:16]`. Identidad estable entre corridas: no cambia con el título, el costo, el orden ni con correr sin aws-doctor. Es la clave de deduplicación (un finding por fingerprint) y la que usa un historial. El `id` (F001…) es solo para leer y cambia entre corridas.
-- `price_source`: `ce_actual` (Cost Explorer), `aws_doctor` (estimación de aws-doctor), `static_estimate` (precio de referencia de una regla) o `null` si no hay `monthly_usd`.
-- `is_saving`: `true` para `desperdicio` y `costo`. Los totales de `findings.md` y `reporte.html` suman solo estos.
+- `price_source`: `ce_actual` (Cost Explorer), `pricing_api` (precio de la región del recurso, de la AWS Price List API), `aws_doctor` (estimación de aws-doctor), `static_estimate` (precio de respaldo us-east-1 de una regla) o `null` si no hay `monthly_usd`.
+- `confidence`: confianza del monto según su fuente: `alta` (`ce_actual`), `media` (`pricing_api`, `aws_doctor`), `baja` (`static_estimate`) o `null` sin monto.
+- `is_saving`: `true` para `desperdicio` y `costo`, salvo que la regla marque el monto como gasto informativo (no es un ahorro). Los totales de `findings.md` y `reporte.html` suman solo estos.
+
+**precios.json** (fase 3, junto a `findings.json`): los precios on-demand que usaron las reglas, `{"generated_at", "cobertura", "precios": {región: {clave: {usd, unidad, descripcion, usagetype, fuente, consulta}}}}`. Sale de la Price List API (endpoint us-east-1, filtro `regionCode`), con cache del día en `<output_dir>/.precios/`. Se reescribe en cada validación. Con `--sin-precios` o si la API falla, las reglas usan su precio de respaldo y lo marcan `static_estimate`; el error queda en `errors`. `cobertura` (también en `run.flags.validar.precios`): `pricing_api` (todos los precios pedidos), `parcial`, `static_estimate` (ninguno) o `n/a` (nada que cotizar).
 
 ```json
 {

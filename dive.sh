@@ -5,6 +5,7 @@
 # Uso:
 #   bash dive.sh --config ~/clientes/acme/dive.config.yaml
 #   bash dive.sh --config ... --sin-doctor        # fase V sin aws-doctor
+#   bash dive.sh --config ... --sin-precios       # fase V sin la Price List API (precios estimados de us-east-1)
 #   bash dive.sh --config ... --sin-dashboard     # no abre el dashboard al final
 #   bash dive.sh --config ... --sin-navegador     # abre el dashboard pero solo imprime la URL
 #
@@ -17,9 +18,9 @@ RAIZ="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 export PYTHONUNBUFFERED=1   # la fase 1 va por tee: sin esto su salida aparece toda al final
 PY="$RAIZ/.venv/bin/python"
 CONFIG="${DIVE_CONFIG:-}"
-SIN_DOCTOR=false; SIN_DASHBOARD=false; SIN_NAVEGADOR=false
+SIN_DOCTOR=false; SIN_PRECIOS=false; SIN_DASHBOARD=false; SIN_NAVEGADOR=false
 
-ayuda() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+ayuda() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 && "$2" != --* ]] || { echo "--config necesita una ruta (ver --help)" >&2; exit 2; }
       CONFIG="$2"; shift 2 ;;
     --sin-doctor) SIN_DOCTOR=true; shift ;;
+    --sin-precios) SIN_PRECIOS=true; shift ;;
     --sin-dashboard) SIN_DASHBOARD=true; shift ;;
     --sin-navegador) SIN_NAVEGADOR=true; shift ;;
     -h|--help) ayuda; exit 0 ;;
@@ -179,6 +181,7 @@ CORRIDA="$(sed -n 's#^→ \(.*\)/discovery\.json$#\1#p' "$SALIDA_F1" | tail -n 1
 fase "2/5 Inventariar" 2-inventariar/inventariar.py --discovery "$CORRIDA/discovery.json"
 VALIDAR_ARGS=(--inventory "$CORRIDA/inventory.json")
 $SIN_DOCTOR && VALIDAR_ARGS+=(--sin-doctor)
+$SIN_PRECIOS && VALIDAR_ARGS+=(--sin-precios)
 fase "3/5 Validar" 3-validar/validar.py "${VALIDAR_ARGS[@]}"
 fase "4/5 Esquematizar (diagramas)" 4-esquematizar/esquematizar.py --inventory "$CORRIDA/inventory.json"
 fase "5/5 Reporte" 4-esquematizar/reporte.py --inventory "$CORRIDA/inventory.json"

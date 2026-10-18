@@ -22,6 +22,9 @@ ISSUE_CANONICO = {
     "regla.root_sin_mfa": "root.no_mfa", "aws-doctor.root_user_waste": "root.no_mfa",
 }
 FUENTE_PRECIO = {"regla": "static_estimate", "aws-doctor": "aws_doctor", "cruce-billing": "ce_actual"}
+# Confianza del monto según de dónde salió el precio (Ley 5 de la skill FinOps: cada monto con su confianza).
+CONFIANZA_PRECIO = {"ce_actual": "alta", "cost_optimization_hub": "alta", "pricing_api": "media",
+                    "aws_doctor": "media", "static_estimate": "baja"}
 
 
 def huella(issue_id, account_id, region, resource_id, discriminador=None):
@@ -36,18 +39,21 @@ def completar_v2(f):
     rule_id = f.get("rule_id") or f"{f['source']}.desconocida"
     issue = ISSUE_CANONICO.get(rule_id, rule_id)
     disc = f.pop("_discriminador", None)
+    fuente = (f.get("price_source") or FUENTE_PRECIO.get(f["source"])) if f["monthly_usd"] is not None else None
     f.update({
         "rule_id": rule_id,
         "issue_id": issue,
         "fingerprint": f.get("fingerprint") or huella(issue, f["account_id"], f["region"], f["resource_id"], disc),
-        "price_source": FUENTE_PRECIO.get(f["source"]) if f["monthly_usd"] is not None else None,
-        "is_saving": f["category"] in CATEGORIAS_AHORRO,
+        "price_source": fuente,
+        "confidence": f.get("confidence") or CONFIANZA_PRECIO.get(fuente),
+        # is_saving=False puesto por la regla: costo informativo, gasto existente y no un ahorro (ej. IPv4 pública).
+        "is_saving": f["category"] in CATEGORIAS_AHORRO and f.get("is_saving") is not False,
     })
     return f
 
 
 def hallazgo(category, severity, account_id, region, resource_id, title, detail, monthly_usd, source,
-             rule_id=None, discriminador=None):
+             rule_id=None, discriminador=None, price_source=None, ahorro=True):
     """Un finding con las claves exactas del contrato (el id se asigna al final, al ordenar). Los campos v2
     (issue_id, fingerprint...) se completan en validar con completar_v2; rule_id puede venir después."""
     f = {
@@ -66,6 +72,10 @@ def hallazgo(category, severity, account_id, region, resource_id, title, detail,
         f["rule_id"] = rule_id
     if discriminador is not None:
         f["_discriminador"] = discriminador
+    if price_source:
+        f["price_source"] = price_source
+    if not ahorro:
+        f["is_saving"] = False
     return f
 
 

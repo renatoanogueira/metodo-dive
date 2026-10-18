@@ -194,7 +194,7 @@ def test_validar_completo(tmp_path, monkeypatch):
     datos = json.loads((tmp_path / "findings.json").read_text())
     assert set(datos) >= {"generated_at", "findings"}
     claves = {"id", "category", "severity", "account_id", "region", "resource_id", "title", "detail",
-              "rule_id", "issue_id", "fingerprint", "price_source", "is_saving",
+              "rule_id", "issue_id", "fingerprint", "price_source", "confidence", "is_saving",
               "monthly_usd", "source"}
     assert all(set(f) == claves for f in datos["findings"])
     assert {f["source"] for f in findings} == {"aws-doctor", "cruce-billing", "regla"}

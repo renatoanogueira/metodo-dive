@@ -91,7 +91,7 @@ bash dive.sh --config ~/clientes/acme/dive.config.yaml --sin-doctor --sin-dashbo
 bash dive.sh                                   # sin --config: busca dive.config.yaml en tu carpeta personal y pregunta
 ```
 
-Opciones: `--sin-doctor`, `--sin-dashboard`, `--sin-navegador` (abre el dashboard sin abrir el navegador). Comprueba antes el entorno (venv, config, perfiles `dive-*`, sesión de AWS) y, si falta algo, dice el comando exacto para arreglarlo (si la sesión de AWS expiró, ofrece hacer el `aws sso login` ahí mismo). Corre las fases sobre una corrida nueva, se para en la primera que falle (indicando cómo retomar solo esa fase) y al final abre el dashboard.
+Opciones: `--sin-doctor`, `--sin-precios` (precios estimados de us-east-1 en vez de la Price List API), `--sin-dashboard`, `--sin-navegador` (abre el dashboard sin abrir el navegador). Comprueba antes el entorno (venv, config, perfiles `dive-*`, sesión de AWS) y, si falta algo, dice el comando exacto para arreglarlo (si la sesión de AWS expiró, ofrece hacer el `aws sso login` ahí mismo). Corre las fases sobre una corrida nueva, se para en la primera que falle (indicando cómo retomar solo esa fase) y al final abre el dashboard.
 
 #### Uso: correr las fases
 
@@ -240,7 +240,7 @@ bash dive.sh --config ~/clientes/acme/dive.config.yaml --sin-doctor --sin-dashbo
 bash dive.sh                                   # without --config: looks for dive.config.yaml in your home folder and asks
 ```
 
-Options: `--sin-doctor`, `--sin-dashboard`, `--sin-navegador` (starts the dashboard without opening the browser). It first checks the environment (venv, config, `dive-*` profiles, AWS session) and, if something is missing, prints the exact command to fix it (if the AWS session expired, it offers to run `aws sso login` right there). It runs the phases on a new run, stops at the first one that fails (showing how to resume only that phase), and opens the dashboard at the end.
+Options: `--sin-doctor`, `--sin-precios` (us-east-1 estimated prices instead of the Price List API), `--sin-dashboard`, `--sin-navegador` (starts the dashboard without opening the browser). It first checks the environment (venv, config, `dive-*` profiles, AWS session) and, if something is missing, prints the exact command to fix it (if the AWS session expired, it offers to run `aws sso login` right there). It runs the phases on a new run, stops at the first one that fails (showing how to resume only that phase), and opens the dashboard at the end.
 
 #### Usage: running the phases
 
@@ -389,7 +389,7 @@ bash dive.sh --config ~/clientes/acme/dive.config.yaml --sin-doctor --sin-dashbo
 bash dive.sh                                   # sem --config: procura dive.config.yaml na sua pasta pessoal e pergunta
 ```
 
-Opções: `--sin-doctor`, `--sin-dashboard`, `--sin-navegador` (abre o dashboard sem abrir o navegador). Antes verifica o ambiente (venv, config, perfis `dive-*`, sessão da AWS) e, se faltar algo, mostra o comando exato para resolver (se a sessão da AWS expirou, oferece fazer o `aws sso login` ali mesmo). Roda as fases numa execução nova, para na primeira que falhar (mostrando como retomar só essa fase) e no fim abre o dashboard.
+Opções: `--sin-doctor`, `--sin-precios` (preços estimados de us-east-1 em vez da Price List API), `--sin-dashboard`, `--sin-navegador` (abre o dashboard sem abrir o navegador). Antes verifica o ambiente (venv, config, perfis `dive-*`, sessão da AWS) e, se faltar algo, mostra o comando exato para resolver (se a sessão da AWS expirou, oferece fazer o `aws sso login` ali mesmo). Roda as fases numa execução nova, para na primeira que falhar (mostrando como retomar só essa fase) e no fim abre o dashboard.
 
 #### Uso: rodar as fases
 
