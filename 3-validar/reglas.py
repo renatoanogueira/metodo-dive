@@ -35,7 +35,18 @@ def precios_necesarios(inventory):
         elif r.get("type") == "snapshot":
             claves.add("snapshot_gb_mes")
         elif r.get("type") == "elastic_ip":
-            claves.add("ipv4_ociosa_hora")
+            claves.add("ipv4_hora" if a.get("associated") else "ipv4_ociosa_hora")
+        elif r.get("type") == "instance" and r.get("service") == "ec2" and a.get("public_ip"):
+            claves.add("ipv4_hora")
+        elif r.get("type") == "nat_gateway" and a.get("public_ips"):
+            claves.add("ipv4_hora")
+        elif r.get("type") == "load_balancer" and a.get("lb_type") in ("application", "network"):
+            claves.add("alb_hora" if a["lb_type"] == "application" else "nlb_hora")
+        elif r.get("type") == "log_group" and a.get("retention_days") is None:
+            claves.add("logs_gb_mes")
+        elif r.get("service") == "rds" and r.get("type") == "instance" and a.get("storage_type") == "gp2":
+            claves.update({"rds_gb_mes:gp2", "rds_gb_mes:gp3"})
+    # (RDS: el almacenamiento cuesta lo mismo en todos los motores, verificado en la API; no se filtra por motor.)
     # Un volume_type que common.precios no sabe consultar (uno nuevo) usa el precio de respaldo de la regla.
     pedidos = {reg: {k for k in c if k in CONSULTAS} for reg, c in pedidos.items()}
     return {reg: c for reg, c in pedidos.items() if c}
@@ -47,7 +58,14 @@ FUENTE = "regla"
 PRECIO_EBS_GB = {"gp3": 0.08, "gp2": 0.10, "io1": 0.125, "io2": 0.125, "st1": 0.045, "sc1": 0.015, "standard": 0.05}
 PRECIO_SNAPSHOT_GB = 0.05
 PRECIO_IPV4_HORA = 0.005
+PRECIO_LB_HORA = {"application": 0.0225, "network": 0.0225}  # gateway y classic cobran distinto: sin estimado
+PRECIO_LOGS_GB = 0.03
 HORAS_MES = 730
+MAX_EJEMPLOS = 5
+# Familias EC2 antiguas (algunas AWS aún las lista como current generation): las nuevas rinden más por igual o
+# menos dinero.
+FAMILIAS_ANTIGUAS = {"t1", "t2", "m1", "m2", "m3", "m4", "c1", "c3", "c4", "r3", "r4", "i2", "d2", "g2", "g3",
+                     "p2", "x1", "x1e"}
 
 DIAS_SNAPSHOT_VIEJO = 180
 DIAS_EC2_DETENIDA = 30
@@ -343,6 +361,201 @@ def regla_root(recursos, ctx):
     return out
 
 
+def _por_cuenta_region(recursos, condicion):
+    grupos = {}
+    for r in recursos:
+        if condicion(r):
+            grupos.setdefault((r["account_id"], r["region"]), []).append(r)
+    return grupos
+
+
+def _ejemplos(nombres):
+    extra = f" (+{len(nombres) - MAX_EJEMPLOS} más)" if len(nombres) > MAX_EJEMPLOS else ""
+    return ", ".join(nombres[:MAX_EJEMPLOS]) + extra
+
+
+def regla_lb_sin_targets(recursos, ctx):
+    """LB sin ningún target registrado en sus target groups (o sin target groups) y sin listener que responda
+    solo (redirect / fixed-response): se cobra la hora del LB sin servir a nadie. Un target group no cuesta:
+    el costo es del LB. Targets registrados pero no sanos son otro problema (no se marcan aquí). Un classic
+    sin instancias registradas también; gateway y classic cobran distinto, así que van sin monto."""
+    con_targets = {lb for r in recursos if _es(r, {"elb"}, "target_group") and _attrs(r).get("targets")
+                   for lb in (r.get("relations") or {}).get("attached_to", [])}
+    out = []
+    for r in recursos:
+        if _es(r, {"elb"}, "classic_load_balancer") and not (r.get("relations") or {}).get("target_ids"):
+            # El id de inventario de un classic es su nombre; el finding usa el ARN, como aws-doctor y los ALB/NLB.
+            out.append(hallazgo("desperdicio", "media", r["account_id"], r["region"], r.get("arn") or r["id"],
+                                "Load balancer sin targets", f"{r.get('name') or r['id']} (classic): ninguna instancia registrada. Confirmar que no "
+                                "se usa y borrarlo.", None, FUENTE))
+            continue
+        if (not _es(r, {"elb"}, "load_balancer") or r["id"] in con_targets
+                or r.get("state") not in (None, "active", "active_impaired")):
+            continue
+        a = _attrs(r)
+        acciones = {t for li in a.get("listeners") or [] for t in li.get("default_actions") or []}
+        if acciones & {"redirect", "fixed-response"}:
+            continue
+        tipo = a.get("lb_type")
+        estatico = PRECIO_LB_HORA.get(tipo)
+        usd, fuente, precio_txt = None, None, ""
+        if estatico is not None:
+            hora, fuente = _precio(ctx, r["region"], "alb_hora" if tipo == "application" else "nlb_hora", estatico)
+            usd = hora * HORAS_MES
+            precio_txt = f" Mínimo: {_texto_precio(hora, 'hora', fuente)} × {HORAS_MES} h, sin LCU."
+        out.append(hallazgo("desperdicio", severidad_por_costo(usd, "media"), r["account_id"], r["region"], r["id"],
+                            "Load balancer sin targets",
+                            f"{r.get('name') or r['id']} ({tipo}): ningún target registrado y ningún listener con "
+                            f"redirect o respuesta fija. Confirmar que no se usa y borrarlo.{precio_txt}",
+                            usd, FUENTE, price_source=fuente))
+    return out
+
+
+def regla_logs_sin_retencion(recursos, ctx):
+    """Agregado por cuenta × región (la misma granularidad que aws-doctor). El monto es lo que cuesta hoy el
+    almacenamiento, no un ahorro: definir retención solo borra lo que sea más viejo que el plazo."""
+    out = []
+    grupos = _por_cuenta_region(recursos, lambda r: _es(r, {"logs"}, "log_group")
+                                and _attrs(r).get("retention_days") is None)
+    for (cuenta, region), grupo in sorted(grupos.items()):
+        gb = sum(_attrs(r).get("stored_gb") or 0 for r in grupo)
+        gb_mes, fuente = _precio(ctx, region, "logs_gb_mes", PRECIO_LOGS_GB)
+        usd = gb * gb_mes
+        grandes = sorted(grupo, key=lambda r: -(_attrs(r).get("stored_gb") or 0))
+        ejemplos = _ejemplos([f"{r.get('name') or r['id']} ({_attrs(r).get('stored_gb') or 0:g} GB)" for r in grandes])
+        out.append(hallazgo("costo", "baja", cuenta, region, None, f"Log groups sin retención ({len(grupo)})",
+                            f"{len(grupo)} log groups guardan {gb:,.1f} GB para siempre. Almacenamiento actual: "
+                            f"{_texto_precio(gb_mes, 'GB-mes', fuente)}; es gasto, no ahorro (la retención solo "
+                            f"borra lo viejo). Más grandes: {ejemplos}.", usd, FUENTE, price_source=fuente,
+                            ahorro=False))
+    return out
+
+
+def regla_nat_sin_endpoint(recursos, ctx):
+    """El tráfico a S3/DynamoDB desde subredes privadas pasa por el NAT y paga procesamiento por GB; un gateway
+    endpoint es gratis. Sin $: depende del tráfico, que el inventario no tiene."""
+    endpoints = {}
+    for r in recursos:
+        if (_es(r, {"vpc"}, "vpc_endpoint") and (_attrs(r).get("endpoint_type") or "").lower() == "gateway"
+                and r.get("state") in (None, "available")):
+            servicio = (_attrs(r).get("service_name") or "").rsplit(".", 1)[-1]
+            endpoints.setdefault((r["account_id"], r["region"], (r.get("relations") or {}).get("vpc_id")), set()).add(servicio)
+    con_dynamo = {(r["account_id"], r["region"]) for r in recursos if _es(r, {"dynamodb"}, "table")}
+    out = []
+    for r in recursos:
+        # Un NAT privado no sale a los endpoints públicos de S3/DynamoDB: no aplica.
+        if (not _es(r, {"vpc"}, "nat_gateway") or r.get("state") not in (None, "available")
+                or _attrs(r).get("connectivity") == "private"):
+            continue
+        vpc = (r.get("relations") or {}).get("vpc_id")
+        tiene = endpoints.get((r["account_id"], r["region"], vpc), set())
+        faltan = [s for s in ("s3", "dynamodb") if s not in tiene and
+                  (s == "s3" or (r["account_id"], r["region"]) in con_dynamo)]
+        if faltan:
+            out.append(hallazgo("costo", "baja", r["account_id"], r["region"], r["id"],
+                                "NAT Gateway sin gateway endpoint de " + " ni ".join(s.upper() if s == "s3" else "DynamoDB"
+                                                                                    for s in faltan),
+                                f"{'VPC ' + vpc if vpc else 'Su VPC'}: el tráfico a {', '.join(faltan)} pasa por el NAT y paga procesamiento por "
+                                "GB. Un gateway endpoint es gratis; el ahorro depende del tráfico (ver NatGateway-Bytes "
+                                "en Cost Explorer).", None, FUENTE))
+    return out
+
+
+def regla_ipv4_publica(recursos, ctx):
+    """Desde feb/2024 AWS cobra cada IPv4 pública por hora, esté o no asociada. Se cuentan IPs distintas por
+    cuenta × región (una EIP asociada es también la public_ip de la instancia o del NAT). Es gasto
+    informativo, no un ahorro, y es un mínimo: los load balancers públicos también usan IPv4 y no se cuentan."""
+    ips = {}
+    for r in recursos:
+        a = _attrs(r)
+        llave = (r["account_id"], r["region"])
+        if _es(r, {"ec2"}, "instance") and r.get("state") == "running" and a.get("public_ip"):
+            ips.setdefault(llave, set()).add(a["public_ip"])
+        elif _es(r, {"eip", "ec2"}, "elastic_ip") and a.get("associated") and a.get("public_ip"):
+            ips.setdefault(llave, set()).add(a["public_ip"])
+        elif _es(r, {"vpc"}, "nat_gateway") and r.get("state") in (None, "available"):
+            ips.setdefault(llave, set()).update(a.get("public_ips") or [])
+    out = []
+    for (cuenta, region), conjunto in sorted(ips.items()):
+        hora, fuente = _precio(ctx, region, "ipv4_hora", PRECIO_IPV4_HORA)
+        out.append(hallazgo("costo", "baja", cuenta, region, None, f"IPv4 públicas en uso ({len(conjunto)})",
+                            f"{len(conjunto)} IPv4 públicas (instancias, EIPs asociadas y NAT), "
+                            f"{_texto_precio(hora, 'hora', fuente)} × {HORAS_MES} h cada una. Es gasto, no ahorro; "
+                            "mínimo (sin las de load balancers públicos). Revisar si cada una necesita IP pública "
+                            "(SSM Session Manager, ALB o IPv6 en su lugar).", hora * HORAS_MES * len(conjunto), FUENTE,
+                            price_source=fuente, ahorro=False))
+    return out
+
+
+def regla_rds_gp2(recursos, ctx):
+    """Solo con precios de la región: en RDS gp2 y gp3 suelen costar lo mismo, así que no se inventa una
+    diferencia con precios de EBS. Sin diferencia, queda la mejora de rendimiento base (sin $)."""
+    out = []
+    for r in recursos:
+        a = _attrs(r)
+        if not (_es(r, {"rds"}, "instance") and a.get("storage_type") == "gp2"):
+            continue
+        gb = a.get("allocated_storage_gb") or 0
+        gp2, f2 = precio(ctx.get("precios"), r["region"], "rds_gb_mes:gp2")
+        gp3, f3 = precio(ctx.get("precios"), r["region"], "rds_gb_mes:gp3")
+        az = 2 if a.get("multi_az") else 1
+        # gp2 da 3 IOPS por GB: por encima de 12000 IOPS base, gp3 sin IOPS provisionadas rinde menos.
+        aviso = (f" Ojo: con {gb} GB gp2 da {gb * 3} IOPS base, más que el base de gp3; provisionar IOPS al "
+                 "migrar (y recalcular el costo)." if gb * 3 > 12000 else "")
+        usd = gb * az * (gp2 - gp3) if f2 == f3 == "pricing_api" and gp2 > gp3 else None
+        texto = (f"{gp2:g} → {gp3:g} USD/GB-mes (Price List API, Single-AZ{' ×2 por Multi-AZ' if az == 2 else ''})"
+                 if f2 == f3 == "pricing_api" else "sin precio de la región")
+        out.append(hallazgo("costo", "baja", r["account_id"], r["region"], r["id"], "RDS con almacenamiento gp2",
+                            f"{gb} GB gp2 → gp3: {texto}. gp3 trae rendimiento base fijo (3000 IOPS y 125 MiB/s; "
+                            "12000 y 500 desde 400 GB, salvo SQL Server) en vez de depender del tamaño; se cambia sin "
+                            f"downtime (modify-db-instance).{aviso}", usd, FUENTE,
+                            price_source="pricing_api" if usd is not None else None))
+    return out
+
+
+def regla_lambda_x86(recursos, ctx):
+    """Agregado por cuenta × región. arm64 (Graviton) cobra ~20% menos por GB-s; sin $ porque depende de la
+    duración real, y no toda función migra sin cambios (dependencias nativas, imágenes de contenedor)."""
+    out = []
+    grupos = _por_cuenta_region(recursos, lambda r: _es(r, {"lambda"}, "function")
+                                and (_attrs(r).get("architectures") or ["x86_64"]) == ["x86_64"])
+    for (cuenta, region), grupo in sorted(grupos.items()):
+        imagenes = sum(1 for r in grupo if _attrs(r).get("package_type") == "Image")
+        nota = f" {imagenes} usan imagen de contenedor (hay que reconstruirla para arm64)." if imagenes else ""
+        out.append(hallazgo("costo", "baja", cuenta, region, None, f"Lambdas x86_64 migrables a arm64 ({len(grupo)})",
+                            f"{len(grupo)} funciones en x86_64: {_ejemplos(sorted(r['id'] for r in grupo))}. arm64 "
+                            f"cobra ~20% menos por GB-s; probar antes (dependencias nativas).{nota}", None, FUENTE))
+    return out
+
+
+def regla_ec2_generacion_antigua(recursos, ctx):
+    out = []
+    for r in recursos:
+        a = _attrs(r)
+        familia = (a.get("instance_type") or "").split(".")[0]
+        if _es(r, {"ec2"}, "instance") and r.get("state") == "running" and familia in FAMILIAS_ANTIGUAS:
+            out.append(hallazgo("costo", "baja", r["account_id"], r["region"], r["id"],
+                                "Instancia EC2 de una familia antigua",
+                                f"{r.get('name') or r['id']}: {a.get('instance_type')}. Las familias nuevas (ej. "
+                                "t3/t4g, m6i/m7g, c6i/c7g, r6i/r7g) rinden más por un precio igual o menor (comparar "
+                                "en la región); cambiar requiere parar la instancia.", None, FUENTE))
+    return out
+
+
+def regla_s3_kms_sin_bucket_key(recursos, ctx):
+    """Con SSE-KMS y sin Bucket Key, cada objeto leído o escrito es una llamada a KMS (se cobra por 10.000).
+    Bucket Key la reduce hasta ~99%. Sin $: depende del volumen de requests."""
+    out = []
+    for r in recursos:
+        a = _attrs(r)
+        # Solo aws:kms: DSSE-KMS (aws:kms:dsse) no admite Bucket Key.
+        if _es(r, {"s3"}, "bucket") and a.get("encryption") == "aws:kms" and a.get("bucket_key_enabled") is False:
+            out.append(hallazgo("costo", "baja", r["account_id"], r["region"], r["id"], "Bucket S3 con SSE-KMS sin Bucket Key",
+                                f"{r.get('name') or r['id']}: cada request paga una llamada a KMS. Activar Bucket Key "
+                                "(solo afecta a objetos nuevos o re-copiados).", None, FUENTE))
+    return out
+
+
 REGLAS = [
     regla_ebs_sin_adjuntar,
     regla_eip_sin_asociar,
@@ -356,6 +569,14 @@ REGLAS = [
     regla_s3_sin_bloqueo_publico,
     regla_sin_tags,
     regla_root,
+    regla_lb_sin_targets,
+    regla_logs_sin_retencion,
+    regla_nat_sin_endpoint,
+    regla_ipv4_publica,
+    regla_rds_gp2,
+    regla_lambda_x86,
+    regla_ec2_generacion_antigua,
+    regla_s3_kms_sin_bucket_key,
 ]
 
 

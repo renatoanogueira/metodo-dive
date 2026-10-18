@@ -20,6 +20,9 @@ ISSUE_CANONICO = {
     "regla.snapshots_viejos": "ebs_snapshot.old", "aws-doctor.stale_snapshots": "ebs_snapshot.old",
     "aws-doctor.orphaned_snapshots": "ebs_snapshot.old",
     "regla.root_sin_mfa": "root.no_mfa", "aws-doctor.root_user_waste": "root.no_mfa",
+    # Mismo problema que una categoría de aws-doctor que ya existía: se conserva su issue_id (y su fingerprint).
+    "regla.lb_sin_targets": "aws-doctor.unused_load_balancers",
+    "regla.logs_sin_retencion": "aws-doctor.cloudwatch_log_groups_without_retention_policy",
 }
 FUENTE_PRECIO = {"regla": "static_estimate", "aws-doctor": "aws_doctor", "cruce-billing": "ce_actual"}
 # Confianza del monto según de dónde salió el precio (Ley 5 de la skill FinOps: cada monto con su confianza).

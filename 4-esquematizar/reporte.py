@@ -486,7 +486,7 @@ function hallazgos(){
     var s = sevNorm(f.severity);
     return '<tr><td><span class="sev sev-' + esc(s) + '">' + esc(s) + "</span></td><td>" + esc(f.category) + "</td><td>" + esc(nombreCuenta(f.account_id)) +
       '</td><td class="hide-sm">' + esc(f.region || "—") + '</td><td class="id">' + (f.resource_id ? enlazarIds(f.resource_id) : "—") + "</td><td><b>" + esc(f.title) + "</b>" +
-      (f.detail ? '<div class="sub">' + esc(f.detail) + "</div>" : "") + '</td><td class="num">' + (f.monthly_usd != null ? usd(f.monthly_usd) : "—") + '</td><td class="hide-sm">' + esc(f.source || "") + "</td></tr>";
+      (f.detail ? '<div class="sub">' + esc(f.detail) + "</div>" : "") + '</td><td class="num">' + (f.monthly_usd != null ? usd(f.monthly_usd) + (f.is_saving === false && (f.category === "costo" || f.category === "desperdicio") ? '<div class="sub">(no suma)</div>' : "") : "—") + '</td><td class="hide-sm">' + esc(f.source || "") + "</td></tr>";
   }).join("") || '<tr><td colspan="8" class="empty">' + (D.has_findings ? "Ningún hallazgo coincide" : "No hay findings.json para esta corrida") + "</td></tr>";
 }
 $("h-sev").addEventListener("click", function(ev){ var b = ev.target.closest ? ev.target.closest("[data-sev]") : null; if (b) { sevActiva = b.getAttribute("data-sev"); hallazgos(); } });

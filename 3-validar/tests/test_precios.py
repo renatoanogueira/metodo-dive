@@ -180,7 +180,9 @@ def test_dedup_no_depende_de_la_fuente_de_precio():
     for fuente in ("pricing_api", "static_estimate"):
         regla = hallazgo("desperdicio", "media", CUENTA, "eu-west-1", "vol-1", "t", "d", 8.8, "regla",
                          rule_id="regla.ebs_sin_adjuntar", price_source=fuente)
-        assert [f["rule_id"] for f in validar.deduplicar([doc, regla])] == ["aws-doctor.stopped_instance_volumes"]
+        salida = validar.deduplicar([doc, regla])
+        assert [(f["rule_id"], f["is_saving"]) for f in salida] == [
+            ("aws-doctor.stopped_instance_volumes", True), ("regla.ebs_sin_adjuntar", False)]
 
 
 def test_completar_v2_idempotente_con_informativo():

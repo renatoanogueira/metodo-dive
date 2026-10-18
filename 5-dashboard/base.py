@@ -416,8 +416,11 @@ def recursos(con, org_id, run_id, cuenta=None):
         for k in ("tags", "attrs", "relations"):
             d[k] = json.loads(d[k] or "{}")
         # Los findings de recursos globales (S3, IAM, CloudFront) van con region None; el recurso, con "global".
-        d["n_hallazgos"] = (con_hallazgos.get((d["account_id"], d["region"], d["id"]), 0) +
-                            (con_hallazgos.get((d["account_id"], None, d["id"]), 0) if d["region"] == "global" else 0))
+        # Un finding puede citar el recurso por su ARN (classic LB: el id es el nombre).
+        ids = {d["id"], d.get("arn")} - {None}
+        d["n_hallazgos"] = sum(con_hallazgos.get((d["account_id"], d["region"], i), 0) +
+                               (con_hallazgos.get((d["account_id"], None, i), 0) if d["region"] == "global" else 0)
+                               for i in ids)
         salida.append(d)
     return salida
 

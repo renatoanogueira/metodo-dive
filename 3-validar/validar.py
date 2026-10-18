@@ -14,6 +14,7 @@ Uso: python 3-validar/validar.py [--inventory salida/<corrida>/inventory.json] [
 """
 
 import argparse
+import html
 import importlib
 import pkgutil
 import sys
@@ -213,8 +214,9 @@ def deduplicar(findings):
     primero. Dos problemas distintos del mismo recurso (RDS público y sin cifrar) se mantienen los dos.
 
     Además, un recurso suma ahorro una sola vez: si ya tiene un finding de desperdicio (ej. volumen sin
-    adjuntar), se descarta su costo (migrar gp2→gp3); y entre varios de ahorro del mismo recurso con
-    issue_ids distintos (snapshot huérfano de aws-doctor y viejo de la regla) queda el primero.
+    adjuntar), su costo (migrar gp2→gp3) se mantiene pero con is_saving=False; y entre varios de ahorro del
+    mismo recurso con issue_ids distintos cuenta el primero. No se descarta ninguno: así el conjunto de
+    fingerprints no depende de si corrió aws-doctor (un "idle" suyo no borra el "generación anterior" de una regla).
     """
     findings = [completar_v2(f) for f in findings]
     # 1) Por fingerprint, el de mejor fuente de precio. Solo elige entre detecciones del MISMO problema: el
@@ -228,17 +230,20 @@ def deduplicar(findings):
     # 2) Primero los de desperdicio: si el mismo recurso trae un "costo", el que se conserva es el desperdicio.
     orden = sorted(mejor.values(), key=lambda i: (findings[i]["category"] != "desperdicio",
                                                   primero[findings[i]["fingerprint"]]))
-    con_ahorro, elegidos = set(), set()
+    con_ahorro = set()
     for i in orden:
         f = findings[i]
         recurso = (f["account_id"], f["region"], f["resource_id"])
-        if f["resource_id"] and f["is_saving"]:
+        # Compiten los que traen monto (uno sin $ no puede contar dos veces) y los desperdicios aunque no
+        # traigan monto: un recurso que sobra no suma además su optimización.
+        if f["resource_id"] and f["is_saving"] and (f["monthly_usd"] is not None or f["category"] == "desperdicio"):
             if recurso in con_ahorro:
-                continue
-            con_ahorro.add(recurso)
-        elegidos.add(i)
-    salida = [f for i, f in enumerate(findings) if i in elegidos]
-    return salida
+                f["is_saving"] = False
+                f["detail"] = f"{f['detail']} No suma al ahorro: el recurso ya cuenta en otro hallazgo."
+            else:
+                con_ahorro.add(recurso)
+    elegidos = set(mejor.values())
+    return [f for i, f in enumerate(findings) if i in elegidos]
 
 
 def ordenar_y_numerar(findings):
@@ -251,7 +256,8 @@ def ordenar_y_numerar(findings):
 
 
 def _celda(texto):
-    return str(texto if texto is not None else "—").replace("|", "\\|").replace("\n", " ")
+    # Nombres y tags vienen de la cuenta auditada: se escapa HTML por si el visor de Markdown lo renderiza.
+    return html.escape(str(texto if texto is not None else "—"), quote=False).replace("|", "\\|").replace("\n", " ")
 
 
 def generar_md(findings, discovery, errores):
@@ -263,10 +269,11 @@ def generar_md(findings, discovery, errores):
               f"Generado: {ahora()} · {len(findings)} findings · {len(discovery['accounts'])} cuentas", "",
               f"Ahorro potencial estimado (desperdicio + costo): **${total:,.2f}/mes**. "
               "Es un tope: son estimaciones, y un recurso marcado como desperdicio no suma además su optimización.", "",
-              "| Severidad | Findings | $/mes |", "|---|---:|---:|"]
+              "| Severidad | Findings | Ahorro $/mes |", "|---|---:|---:|"]
     for sev in SEVERIDADES:
         grupo = [f for f in findings if f["severity"] == sev]
-        lineas.append(f"| {sev} | {len(grupo)} | ${sum(f['monthly_usd'] or 0 for f in grupo):,.2f} |")
+        ahorro = sum(f["monthly_usd"] or 0 for f in grupo if f.get("is_saving"))
+        lineas.append(f"| {sev} | {len(grupo)} | ${ahorro:,.2f} |")
 
     fuentes = {}
     for f in findings:
@@ -282,6 +289,8 @@ def generar_md(findings, discovery, errores):
                    "|---|---|---|---|---|---|---:|---|"]
         for f in grupo:
             usd = f"${f['monthly_usd']:,.2f}" if f["monthly_usd"] is not None else "—"
+            if f["monthly_usd"] is not None and not f.get("is_saving") and f["category"] in ("costo", "desperdicio"):
+                usd += " (no suma)"  # gasto informativo o ya contado en otro hallazgo del recurso
             lineas.append(f"| {f['id']} | {f['category']} | {_celda(cuenta(f['account_id']))} | {_celda(f['region'])} | "
                           f"{_celda(f['resource_id'])} | {_celda(f['title'])} | {usd} | {f['source']} |")
         lineas.append("")

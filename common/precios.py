@@ -40,6 +40,7 @@ CONSULTAS = {
     "rds_gb_mes:gp2": ("AmazonRDS", {"productFamily": "Database Storage", "deploymentOption": "Single-AZ"}, "RDS:GP2-Storage", "GB-Mo"),
     "rds_gb_mes:gp3": ("AmazonRDS", {"productFamily": "Database Storage", "deploymentOption": "Single-AZ"}, "RDS:GP3-Storage", "GB-Mo"),
     "alb_hora": ("AWSELB", {"productFamily": "Load Balancer-Application"}, "LoadBalancerUsage", "Hrs"),
+    "nlb_hora": ("AWSELB", {"productFamily": "Load Balancer-Network"}, "LoadBalancerUsage", "Hrs"),
 }
 HORAS_MES = 730  # la convención de AWS para pasar $/hora a $/mes
 # Pocos reintentos y timeouts cortos: todas las claves van al mismo endpoint, así que si no responde no tiene

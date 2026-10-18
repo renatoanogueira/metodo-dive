@@ -333,7 +333,7 @@
                       el("div", { class: "detalle", text: f.category + " · " + f.source + " · " + (f.rule_id || "") })]),
         el("td", { text: nombreCuenta(f.account_id) + (f.region ? " · " + f.region : "") }),
         el("td", { class: "detalle", text: f.resource_id || "—" }),
-        el("td", { class: "num", text: f.monthly_usd != null ? dinero(f.monthly_usd) : "—" }),
+        el("td", { class: "num", text: f.monthly_usd != null ? dinero(f.monthly_usd) + (f.is_saving === false && (f.category === "costo" || f.category === "desperdicio") ? " (no suma)" : "") : "—" }),
         historia,
         celdaEstado(f)
       ]));
@@ -443,7 +443,8 @@
       cuerpo.appendChild(tr);
       if (estado.abierto === clave) {
         var suyos = estado.hallazgos.filter(function (f) {
-          return f.presencia === "presente" && f.account_id === r.account_id && f.resource_id === r.id;
+          return f.presencia === "presente" && f.account_id === r.account_id &&
+            (f.resource_id === r.id || (r.arn && f.resource_id === r.arn));
         }).map(function (f) { return f.severity + " · " + f.title; });
         cuerpo.appendChild(el("tr", { class: "detalle-fila" }, [el("td", { colspan: "8" }, [el("div", { class: "kv" }, [
           bloque("Tags", r.tags), bloque("Atributos", r.attrs), bloque("Relaciones", r.relations),
