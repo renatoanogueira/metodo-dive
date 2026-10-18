@@ -9,13 +9,16 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from common import moneda_de_pago
+
 ESTADOS = ("abierto", "aceptado", "ignorado", "resuelto")
 MAX_NOTA = 2000
 
 ESQUEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY, org_id TEXT NOT NULL, org_alias TEXT, carpeta TEXT NOT NULL,
-    generated_at TEXT, currency TEXT, sin_doctor INTEGER, dive_version TEXT, n_errores INTEGER
+    generated_at TEXT, currency TEXT, sin_doctor INTEGER, dive_version TEXT, n_errores INTEGER,
+    moneda TEXT  -- JSON de discovery.finops.moneda_pago: moneda de la factura y tasa USD → moneda
 );
 CREATE TABLE IF NOT EXISTS cuentas (run_id TEXT, account_id TEXT, name TEXT, PRIMARY KEY (run_id, account_id));
 CREATE TABLE IF NOT EXISTS costos (run_id TEXT, account_id TEXT, region TEXT, service TEXT, month TEXT, usd REAL);
@@ -44,7 +47,7 @@ CREATE INDEX IF NOT EXISTS i_usos_run ON usos (run_id);
 """
 
 
-VERSION_ESQUEMA = 4  # 2: recursos; 3: cargos; 4: uso_total. Al subirla, las corridas se reingieren (el estado
+VERSION_ESQUEMA = 5  # 2: recursos; 3: cargos; 4: uso_total; 5: moneda. Al subirla, las corridas se reingieren (el estado
 TABLAS_CORRIDA = ("runs", "cuentas", "costos", "usos", "findings", "sin_verificar", "recursos", "cargos", "uso_total")
 # del usuario, tabla estado, se conserva).
 
@@ -117,6 +120,21 @@ def _dict(x):
     return x if isinstance(x, dict) else {}
 
 
+SECCIONES_FINOPS = ("savings_plans", "reservas", "anomalias", "hub_optimizacion")
+# Sección de discovery.finops de la que sale cada finding de la fuente "finops" (por rule_id).
+SECCION_REGLA_FINOPS = {"finops.savings_plans_sin_usar": "savings_plans", "finops.savings_plan_vence": "savings_plans",
+                        "finops.cobertura_baja": "savings_plans", "finops.reservas_sin_usar": "reservas",
+                        "finops.sin_anomalias": "anomalias", "finops.anomalias_sin_suscripcion": "anomalias",
+                        "finops.coh_inactivo": "hub_optimizacion"}
+
+
+def _seccion_finops(f):
+    if f["source"] == "cost-optimization-hub":
+        return "hub_optimizacion"
+    return SECCION_REGLA_FINOPS.get(f.get("rule_id")) if f["source"] == "finops" else None
+
+
+
 def _ingerir_corrida(con, carpeta, run, findings, discovery, inventory):
     rid = run["run_id"]
     validar = (run.get("flags") or {}).get("validar") or {}
@@ -124,9 +142,18 @@ def _ingerir_corrida(con, carpeta, run, findings, discovery, inventory):
     # aws-doctor no instalado o sin perfiles: un error sin cuenta. Para la historia es igual que --sin-doctor.
     sin_doctor = bool(validar.get("sin_doctor")) or any(
         e.get("collector") == "aws-doctor" and not e.get("account_id") for e in errores)
-    con.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?)",
+    finops = discovery.get("finops")
+    moneda = moneda_de_pago(discovery)  # None si falta, es USD o tiene forma inválida
+    con.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (rid, run["organization_id"], run.get("org_alias"), str(carpeta), findings.get("generated_at"),
-                 run.get("currency"), int(sin_doctor), run.get("dive_version"), len(errores)))
+                 run.get("currency"), int(sin_doctor), run.get("dive_version"), len(errores),
+                 json.dumps(moneda) if moneda else None))
+    # Secciones FinOps que esta corrida no leyó (--sin-finops, sin permiso, error): sus findings no se pueden
+    # dar por resueltos si faltan.
+    no_leidas = list(SECCIONES_FINOPS) if not isinstance(finops, dict) else [s for s in SECCIONES_FINOPS
+                                                                             if finops.get(s) is None]
+    con.executemany("INSERT INTO sin_verificar VALUES (?,?,?,?)",
+                    [(rid, "*finops", None, f"finops:{s}") for s in no_leidas])
     # Todas las cuentas que aparecen: con costo (discovery), solo inventario o solo cargos (ej. la que paga el SP).
     nombres = {a: (d or {}).get("name") for a, d in _dict(inventory.get("accounts")).items()}
     nombres.update({a: (d or {}).get("name") for a, d in _dict(discovery.get("accounts")).items()})
@@ -181,6 +208,13 @@ def _ingerir_corrida(con, carpeta, run, findings, discovery, inventory):
         if isinstance(s, dict):
             con.execute("INSERT INTO sin_verificar VALUES (?,?,?,?)",
                         (rid, s.get("account_id"), s.get("region"), "región no habilitada"))
+    # Sin budgets de la management (colector caído, cuenta excluida o corrida anterior al colector), la regla
+    # "cuenta sin budget" no afirma nada: que falte no es que se resolvió.
+    mgmt = run.get("management_account_id")
+    escaneo_ok = {(s.get("account_id"), s.get("collector")) for s in inventory.get("scanned") or [] if isinstance(s, dict)}
+    fallos = {(e.get("account_id"), e.get("collector")) for e in inventory.get("errors") or [] if isinstance(e, dict)}
+    if (mgmt, "budgets") not in escaneo_ok or (mgmt, "budgets") in fallos:
+        con.execute("INSERT INTO sin_verificar VALUES (?,?,?,?)", (rid, "*budgets", None, "budgets:management"))
     # Fallos del inventario: sin acceso a la cuenta (todo), o un colector caído en una cuenta × región.
     for e in inventory.get("errors") or []:
         if not isinstance(e, dict) or not e.get("account_id"):
@@ -244,7 +278,16 @@ def _verificable(sin_verif, sin_doctor, f):
     doctor = f["source"] == "aws-doctor"
     if doctor and sin_doctor:
         return False
+    seccion = _seccion_finops(f)
     for acc, reg, motivo in sin_verif:
+        if acc == "*finops":
+            if seccion and motivo == f"finops:{seccion}":
+                return False
+            continue
+        if acc == "*budgets":
+            if f.get("rule_id") == "regla.sin_budget":
+                return False
+            continue
         if acc == "*":  # Cost Explorer falló en la región: el cruce billing ↔ inventario no pudo verla
             if f["source"] == "cruce-billing" and _misma_region(reg, f["region"]):
                 return False
@@ -372,7 +415,7 @@ def resumen(con, org_id, run_id, cuenta=None):
                     "uso": uso_ventana, "factura": round(uso_fact_ventana + cargos_ventana, 2),
                     "impuestos": impuestos_ventana},
         "uso_total_mes": total_mes,
-        "run": dict(run),
+        "run": {**dict(run), "moneda": json.loads(run["moneda"]) if run["moneda"] else None},
         "cuenta": cuenta,
         "tiene_cargos": bool(con.execute("SELECT 1 FROM cargos WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()),
         "cargos": cargos,

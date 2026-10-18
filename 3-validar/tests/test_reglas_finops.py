@@ -268,3 +268,72 @@ def test_desperdicio_sin_monto_bloquea_el_costo_del_mismo_recurso():
     costo = hallazgo("costo", "baja", CUENTA, REGION, "i-1", "otro", "d", 5.0, "regla", rule_id="regla.otro")
     salida = validar.deduplicar([costo, desp])
     assert {f["rule_id"]: f["is_saving"] for f in salida} == {"regla.ec2_detenida": True, "regla.otro": False}
+
+
+# ---------- budgets ----------
+
+def _budget(cuenta, nombre, linked=(), tipo="COST"):
+    return {**r("budgets", "budget", nombre, linked_accounts=list(linked), budget_type=tipo), "account_id": cuenta,
+            "region": "global"}
+
+
+def _inv_budgets(recursos, escaneadas, falladas=(), mgmt="900000000000"):
+    cuentas = {"900000000000": {}, "111111111111": {}, "222222222222": {}}
+    return {"generated_at": "2026-10-18T00:00:00Z", "run": {"management_account_id": mgmt}, "accounts": cuentas,
+            "scanned": [{"account_id": a, "region": "us-east-1", "collector": "budgets"} for a in escaneadas],
+            "errors": [{"account_id": a, "region": "us-east-1", "collector": "budgets"} for a in falladas],
+            "resources": recursos}
+
+
+def _sin_budget(inv):
+    return sorted(f["account_id"] for f in reglas.aplicar(inv) if f["rule_id"] == "regla.sin_budget")
+
+
+def test_sin_budget_solo_donde_el_colector_corrio():
+    todas = ["900000000000", "111111111111", "222222222222"]
+    assert _sin_budget(_inv_budgets([], todas)) == sorted(todas)
+    assert _sin_budget(_inv_budgets([], ["900000000000", "111111111111"])) == ["111111111111", "900000000000"]
+    assert _sin_budget(_inv_budgets([], todas, falladas=["222222222222"])) == ["111111111111", "900000000000"]
+    # Sin mirar la management (excluida o con error) no se afirma nada: ahí suelen estar los budgets centrales.
+    assert _sin_budget(_inv_budgets([], ["111111111111", "222222222222"])) == []
+    assert _sin_budget(_inv_budgets([], todas, falladas=["900000000000"])) == []
+
+
+def test_budget_propio_o_central_filtrado_cubre_la_cuenta():
+    todas = ["900000000000", "111111111111", "222222222222"]
+    recursos = [_budget("111111111111", "propio"), _budget("900000000000", "central", ["222222222222"])]
+    assert _sin_budget(_inv_budgets(recursos, todas)) == []  # la management tiene el central
+
+
+def test_budget_de_toda_la_org_en_la_management_cubre_todo():
+    todas = ["900000000000", "111111111111", "222222222222"]
+    assert _sin_budget(_inv_budgets([_budget("900000000000", "org")], todas)) == []
+    # El mismo budget sin filtro pero en una cuenta miembro solo cubre esa cuenta.
+    assert _sin_budget(_inv_budgets([_budget("111111111111", "suyo")], todas)) == ["222222222222", "900000000000"]
+    # Uno de la management filtrado por servicio no vigila el total: solo cubre a la management.
+    solo_ec2 = _budget("900000000000", "ec2")
+    solo_ec2["attrs"]["filtrado"] = True
+    assert _sin_budget(_inv_budgets([solo_ec2], todas)) == ["111111111111", "222222222222"]
+
+
+def test_findings_md_con_moneda_de_pago():
+    from common import moneda_de_pago
+    disc = {"accounts": {CUENTA: {"name": "test"}},
+            "finops": {"moneda_pago": {"codigo": "EUR", "tasa": 0.878, "periodo": "2026-09", "fuente": "invoice"}}}
+    findings = validar.ordenar_y_numerar(validar.deduplicar(reglas.aplicar({"resources": [
+        r("ebs", "volume", "vol-1", "available", size_gb=100, volume_type="gp3")]})))
+    md = validar.generar_md(findings, disc, [])
+    assert "**$8.00/mes** (se paga en EUR: tasa 0.878 EUR por dólar, factura de 2026-09)" in md
+    assert "7.02" not in md  # sin el monto convertido (el anonimizador no lo redondearía)
+    for malo in ({"codigo": "USD", "tasa": 1}, {"codigo": "EUR", "tasa": True}, {"codigo": "EURO", "tasa": 0.9},
+                 {"codigo": "eur", "tasa": 0.9}, {"codigo": "<b>", "tasa": 0.9},
+                 {"codigo": "EUR", "tasa": float("inf")}, None):
+        assert moneda_de_pago({"finops": {"moneda_pago": malo}}) is None
+
+
+
+def test_solo_budgets_de_costo_cubren():
+    todas = ["900000000000", "111111111111", "222222222222"]
+    sp = _budget("900000000000", "cobertura SP", tipo="SAVINGS_PLANS_COVERAGE")  # sin filtro, pero no vigila gasto
+    uso = _budget("111111111111", "horas", tipo="USAGE")
+    assert _sin_budget(_inv_budgets([sp, uso], todas)) == sorted(todas)

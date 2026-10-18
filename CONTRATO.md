@@ -70,6 +70,12 @@ setup/  →  1-descubrir → discovery.json
 - `charges_monthly_usd` (al nivel de `accounts`): `{cuenta: {record_type: {mes: usd}}}` con lo que NO es uso: `Tax`, `SavingsPlanRecurringFee` / `SavingsPlanUpfrontFee` (cuota del compromiso), `SavingsPlanNegation` (el descuento: anula el `SavingsPlanCoveredUsage` contado en `services`), `Recurring` / `Fee` (RIs), `Credit`, `Refund`... Factura del mes = `usage_total_monthly_usd` (uso sin umbral) + suma de estos cargos. Los `services` solos son el uso a precio de lista con el umbral aplicado (sin impuestos ni descuentos de compromisos). Fuera de la factura quedan los servicios de `SERVICIOS_NO_RECURSOS` cuyo registro sea de uso (ej. AWS Support, si se cobra como `Usage`).
 - `usage_total_monthly_usd` (al nivel de `accounts`): `{cuenta: {mes: usd}}`, uso por cuenta sin umbral.
 - En `errors`, `"query": "usage_type"` marca que falló solo la consulta de tipos de uso (los `services` siguen completos).
+- `finops` (opcional; falta con `--sin-finops`): datos de la organización leídos desde la cuenta management. Cada sección es `null` si no se pudo leer, y el motivo queda en `finops.avisos` (`[{"seccion", "tipo": "sin_permiso" | "error", "error"}]`).
+  - `savings_plans`: `activos` (`id`, `tipo`, `pago`, `region`, `compromiso_usd_hora`, `inicio`, `fin`), `utilizacion` de los últimos 30 días (`compromiso_usd`, `usado_usd`, `no_usado_usd`, `porcentaje`, `ahorro_neto_usd`) y `cobertura` (`porcentaje`, `on_demand_usd`, `cubierto_usd`). Sin Savings Plans activos, `utilizacion` y `cobertura` son `null`.
+  - `reservas.utilizacion`: igual para las RIs (`null` si no hay horas compradas).
+  - `anomalias`: `monitores` (`tipo`, `dimension`) y número de `suscripciones` de Cost Anomaly Detection.
+  - `hub_optimizacion` (Cost Optimization Hub; la clave no lleva "cost" para que el anonimizador no trate días y conteos como costos): `estado` (`Active` si está habilitado), `modo_estimacion` (`AfterDiscounts` = los ahorros ya descuentan Savings Plans y RIs) y `recomendaciones` de las cuentas del config (`cuenta`, `region`, `resource_id`, `tipo`, `accion`, `ahorro_usd`, `costo_actual_usd`, `esfuerzo`, `reinicio`, `reversible`, `actual`, `recomendado`, `dias_analizados`, `origen`).
+  - `moneda_pago`: moneda en la que se paga la factura y tasa USD → moneda (`codigo`, `tasa`, `periodo`, `fuente`: `invoice` | `config`, `por_entidad`: `[{"entidad", "tasa", "peso"}]`). Sale del último mes con facturas (Invoicing API); con varias entidades de facturación la tasa se pondera por lo facturado en USD por cada una. No guarda totales de la factura, solo tasas y pesos. Sin permiso o sin facturas, usa `moneda: {codigo, tasa}` del config si existe. Los montos de DIVE siguen en USD: la moneda es solo para mostrarlos.
 
 ## inventory.json (fase 2)
 
@@ -125,10 +131,10 @@ def collect(session, region, account_id):
 
 Campos v2 (aditivos) de cada finding:
 
-- `rule_id`: de dónde salió: `regla.<nombre>`, `aws-doctor.<categoría>` o `cruce.<tipo>`.
+- `rule_id`: de dónde salió: `regla.<nombre>`, `aws-doctor.<categoría>`, `cruce.<tipo>`, `cost-optimization-hub.<acción>.<tipo>` o `finops.<nombre>` (compromisos, anomalías).
 - `issue_id`: el problema canónico. Fuentes distintas que detectan lo mismo comparten `issue_id` (ej. `regla.ebs_sin_adjuntar` y `aws-doctor.unused_ebs_volumes` → `ebs.unattached`).
 - `fingerprint`: `sha256(issue_id|account_id|region|resource_id|discriminador)[:16]`. Identidad estable entre corridas: no cambia con el título, el costo, el orden ni con correr sin aws-doctor. Es la clave de deduplicación (un finding por fingerprint) y la que usa un historial. El `id` (F001…) es solo para leer y cambia entre corridas.
-- `price_source`: `ce_actual` (Cost Explorer), `pricing_api` (precio de la región del recurso, de la AWS Price List API), `aws_doctor` (estimación de aws-doctor), `static_estimate` (precio de respaldo us-east-1 de una regla) o `null` si no hay `monthly_usd`.
+- `price_source`: `ce_actual` (Cost Explorer), `cost_optimization_hub` (ahorro estimado por Cost Optimization Hub; con `modo_estimacion` `AfterDiscounts`, ya neto de Savings Plans y RIs), `pricing_api` (precio de la región del recurso, de la AWS Price List API), `aws_doctor` (estimación de aws-doctor), `static_estimate` (precio de respaldo us-east-1 de una regla) o `null` si no hay `monthly_usd`.
 - `confidence`: confianza del monto según su fuente: `alta` (`ce_actual`), `media` (`pricing_api`, `aws_doctor`), `baja` (`static_estimate`) o `null` sin monto.
 - `is_saving`: `true` para `desperdicio` y `costo`, salvo que la regla marque el monto como gasto informativo (no es un ahorro). Los totales de `findings.md` y `reporte.html` suman solo estos.
 
@@ -148,7 +154,7 @@ Campos v2 (aditivos) de cada finding:
       "title": "Volumen EBS sin adjuntar",
       "detail": "...",
       "monthly_usd": 12.5,
-      "source": "aws-doctor | cruce-billing | regla"
+      "source": "aws-doctor | cruce-billing | regla | cost-optimization-hub | finops"
     }
   ],
   "errors": [{"account_id": "123456789012", "region": "eu-west-1", "collector": "aws-doctor/Lambda", "error": "..."}]

@@ -17,7 +17,7 @@ from pathlib import Path
 AQUI = Path(__file__).resolve().parent
 sys.path.insert(0, str(AQUI.parent))
 
-from common import leer_json  # noqa: E402
+from common import leer_json, moneda_de_pago  # noqa: E402
 
 
 def datos_reporte(inventory, findings=None, discovery=None, diagramas=None):
@@ -55,6 +55,7 @@ def datos_reporte(inventory, findings=None, discovery=None, diagramas=None):
         "service_costs": dict(sorted(servicios_costo.items(), key=lambda kv: -kv[1])),
         "diagrams": diagramas or [],
         "has_discovery": bool(discovery),
+        "currency": moneda_de_pago(discovery),
         "has_findings": bool(findings),
     }
 
@@ -480,8 +481,10 @@ function hallazgos(){
     var ahorro = (f.is_saving != null) ? f.is_saving : (f.category === "desperdicio" || f.category === "costo");
     return s + (ahorro ? (Number(f.monthly_usd) || 0) : 0);
   }, 0);
+  var mon = D.currency, eq = (mensual && mon) ? " (≈ " + (mensual * mon.tasa).toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2}) +
+    " " + mon.codigo + ", 1 USD = " + mon.tasa + " " + mon.codigo + (mon.periodo ? ", factura " + mon.periodo : "") + ")" : "";
   $("h-meta").textContent = lista.length + " hallazgos" +
-    (mensual ? " · ahorro potencial estimado (desperdicio + costo): " + usd(mensual) + "/mes" : "");
+    (mensual ? " · ahorro potencial estimado (desperdicio + costo): " + usd(mensual) + "/mes" + eq : "");
   $("h-body").innerHTML = lista.map(function(f){
     var s = sevNorm(f.severity);
     return '<tr><td><span class="sev sev-' + esc(s) + '">' + esc(s) + "</span></td><td>" + esc(f.category) + "</td><td>" + esc(nombreCuenta(f.account_id)) +

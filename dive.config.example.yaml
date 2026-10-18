@@ -20,6 +20,10 @@ max_workers: 10              # hilos en paralelo (cuenta × región × colector)
 output_dir: salida
 org_alias: mi-org            # nombre corto de la organización: identifica sus corridas (por defecto, el o-xxxx)
 
+# Moneda para mostrar los montos (opcional). Por defecto se lee de la factura (moneda de pago y tasa del último
+# mes, permiso invoicing:ListInvoiceSummaries); esto solo se usa si no se puede leer.
+# moneda: {codigo: EUR, tasa: 0.88}
+
 anonymize:
   replace_terms: []          # palabras de marca a reemplazar, ej. ["acme", "acmepay"]
   costs: rounded             # exact | rounded | percent

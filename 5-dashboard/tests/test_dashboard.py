@@ -31,14 +31,15 @@ def _f(fp, titulo, source="regla", usd=10.0, cat="desperdicio", region="eu-west-
 
 
 def _corrida(base_dir, run_id, findings, sin_doctor=False, errores=None, skipped=None, alias="mi-org",
-             inv_errores=None, generado=None):
+             inv_errores=None, generado=None, finops=None):
     c = base_dir / run_id
     c.mkdir()
     run = {"run_id": run_id, "organization_id": ORG, "org_alias": alias, "currency": "USD",
            "flags": {"validar": {"sin_doctor": sin_doctor}}}
     (c / "findings.json").write_text(json.dumps({"run": run, "generated_at": generado or run_id, "findings": findings,
                                                  "errors": errores or []}))
-    (c / "discovery.json").write_text(json.dumps({"run": run, "charges_monthly_usd": {
+    (c / "discovery.json").write_text(json.dumps({"run": run, **({"finops": finops} if finops is not None else {}),
+                                                  "charges_monthly_usd": {
         "111122223333": {"Tax": {"2026-09": 25.0}, "SavingsPlanNegation": {"2026-09": -5.0}}},
         "accounts": {"111122223333": {
         "name": "Prod", "regions": {"eu-west-1": {
@@ -304,3 +305,60 @@ def test_factura_con_uso_sin_umbral_y_cuentas_solo_cargos(tmp_path):
     assert r["factura_ultimo_mes"] == 125.0 + 25.0 - 5.0 + 50.0 and r["gasto_ultimo_mes"] == 120.0
     assert "999900000000" in r["cuentas"] and "444455556666" in r["cuentas"] and r["n_cuentas"] == 3
     assert r["n_cuentas_con_costo"] == 1
+
+
+FINOPS_OK = {"savings_plans": {"activos": []}, "reservas": {"utilizacion": None}, "anomalias": {"monitores": []},
+             "hub_optimizacion": {"estado": "Active", "recomendaciones": []},
+             "moneda_pago": {"codigo": "EUR", "tasa": 0.878, "periodo": "2026-09", "fuente": "invoice", "por_entidad": []}}
+
+
+def test_finops_no_leido_no_resuelve_y_leido_si(tmp_path):
+    coh = _f("c" * 16, "COH", source="cost-optimization-hub")
+    sp = {**_f("s" * 16, "SP sin usar", source="finops"), "rule_id": "finops.savings_plans_sin_usar"}
+    _corrida(tmp_path, "2026-10-01T000000Z", [coh, sp], finops=FINOPS_OK)
+    _corrida(tmp_path, "2026-10-02T000000Z", [], finops=None)                                    # --sin-finops
+    _corrida(tmp_path, "2026-10-03T000000Z", [], finops={**FINOPS_OK, "hub_optimizacion": None})  # COH sin permiso
+    _corrida(tmp_path, "2026-10-04T000000Z", [], finops=FINOPS_OK)
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    for run, esperado in (("2026-10-02T000000Z", ("no_verificado", "no_verificado")),
+                          ("2026-10-03T000000Z", ("no_verificado", "resuelto")),
+                          ("2026-10-04T000000Z", ("resuelto", "resuelto"))):
+        h = _por_fp(base.hallazgos(con, ORG, run))
+        assert (h["c"]["presencia"], h["s"]["presencia"]) == esperado, run
+
+
+def test_moneda_de_la_corrida_en_el_resumen(tmp_path):
+    _corrida(tmp_path, "2026-10-01T000000Z", [], finops=FINOPS_OK)
+    _corrida(tmp_path, "2026-10-02T000000Z", [], finops={**FINOPS_OK, "moneda_pago": {"codigo": "EUR", "tasa": "x"}})
+    _corrida(tmp_path, "2026-10-03T000000Z", [])
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    m = base.resumen(con, ORG, "2026-10-01T000000Z")["run"]["moneda"]
+    assert (m["codigo"], m["tasa"], m["periodo"]) == ("EUR", 0.878, "2026-09")
+    assert base.resumen(con, ORG, "2026-10-02T000000Z")["run"]["moneda"] is None  # forma inválida: se ignora
+    assert base.resumen(con, ORG, "2026-10-03T000000Z")["run"]["moneda"] is None
+
+
+
+def test_sin_budget_no_se_resuelve_si_no_se_miro_la_management(tmp_path):
+    f = {**_f("g" * 16, "Cuenta sin AWS Budget", cat="riesgo"), "rule_id": "regla.sin_budget", "region": None}
+
+    def corrida(run_id, findings, escaneo_mgmt):
+        c = _corrida(tmp_path, run_id, findings)
+        inv = json.loads((c / "inventory.json").read_text())
+        inv["run"] = {**inv["run"], "management_account_id": "999999999999"}
+        inv["scanned"] = [{"account_id": "999999999999", "region": "us-east-1", "collector": "budgets"}] if escaneo_mgmt else []
+        (c / "inventory.json").write_text(json.dumps(inv))
+        for nombre in ("findings.json", "discovery.json"):
+            d = json.loads((c / nombre).read_text())
+            d["run"]["management_account_id"] = "999999999999"
+            (c / nombre).write_text(json.dumps(d))
+
+    corrida("2026-10-01T000000Z", [f], True)
+    corrida("2026-10-02T000000Z", [], False)   # la management no se pudo mirar
+    corrida("2026-10-03T000000Z", [], True)
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-02T000000Z"))["g"]["presencia"] == "no_verificado"
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-03T000000Z"))["g"]["presencia"] == "resuelto"

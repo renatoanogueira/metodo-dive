@@ -23,8 +23,11 @@ ISSUE_CANONICO = {
     # Mismo problema que una categoría de aws-doctor que ya existía: se conserva su issue_id (y su fingerprint).
     "regla.lb_sin_targets": "aws-doctor.unused_load_balancers",
     "regla.logs_sin_retencion": "aws-doctor.cloudwatch_log_groups_without_retention_policy",
+    # Cost Optimization Hub, solo si el inventario confirma que el volumen está available (ver hallazgos_finops).
+    "cost-optimization-hub.ebs_sin_adjuntar": "ebs.unattached",
 }
-FUENTE_PRECIO = {"regla": "static_estimate", "aws-doctor": "aws_doctor", "cruce-billing": "ce_actual"}
+FUENTE_PRECIO = {"regla": "static_estimate", "aws-doctor": "aws_doctor", "cruce-billing": "ce_actual",
+                 "cost-optimization-hub": "cost_optimization_hub", "finops": "ce_actual"}
 # Confianza del monto según de dónde salió el precio (Ley 5 de la skill FinOps: cada monto con su confianza).
 CONFIANZA_PRECIO = {"ce_actual": "alta", "cost_optimization_hub": "alta", "pricing_api": "media",
                     "aws_doctor": "media", "static_estimate": "baja"}

@@ -16,9 +16,9 @@ Inventario de una AWS Organization con muchas cuentas, en una tarde, con IA como
 | Fase | Pregunta | Fuente de verdad | Entregable |
 |---|---|---|---|
 | **0 · Preparar** | ¿Cómo entro a todas las cuentas sin riesgo? | IAM Identity Center | permission set `DIVE_ReadOnly` + perfiles `dive-*` |
-| **D · Descubrir** | ¿Dónde hay algo? ¿Cuánto pago? | Billing (Cost Explorer, 6 meses) | `discovery.json` |
+| **D · Descubrir** | ¿Dónde hay algo? ¿Cuánto pago? | Billing (Cost Explorer, 6 meses) + Savings Plans, Cost Optimization Hub, anomalías y moneda de la factura | `discovery.json` |
 | **I · Inventariar** | ¿Qué hay exactamente? | APIs de AWS, solo donde el billing dice que hay costo | `inventory.json` |
-| **V · Validar** | ¿Está sano? ¿Cuadra con lo que pago? | AWS Doctor + cruce billing ↔ inventario + reglas | `findings.json` / `findings.md` |
+| **V · Validar** | ¿Está sano? ¿Cuadra con lo que pago? | AWS Doctor + Cost Optimization Hub + cruce billing ↔ inventario + reglas FinOps | `findings.json` / `findings.md` |
 | **E · Esquematizar** | ¿Cómo se ve? | `inventory.json` | diagramas `.drawio` + `reporte.html` |
 | **5 · Dashboard** | ¿Qué cambió entre corridas? ¿Qué ya revisé? | todas las corridas | dashboard local en 127.0.0.1 |
 | Anonimizar | ¿Lo puedo mostrar? | todas las salidas | carpeta `-anon` verificada |
@@ -61,7 +61,7 @@ cp dive.config.example.yaml dive.config.yaml   # y ajusta management_profile, or
 
 #### Fase 0 · Preparar el acceso
 
-El rol de escaneo es `ViewOnlyAccess` + [una policy mínima](setup/readonly-policy.json) con exactamente lo que piden los colectores y aws-doctor. `ViewOnlyAccess` sola se queda corta (no trae Cost Explorer ni Transit Gateway), y `ReadOnlyAccess` es demasiado (incluye `s3:GetObject`: leer datos).
+El rol de escaneo es `ViewOnlyAccess` + [una policy mínima](setup/readonly-policy.json) con exactamente lo que piden los colectores y aws-doctor. `ViewOnlyAccess` sola se queda corta (no trae Cost Explorer ni Transit Gateway), y `ReadOnlyAccess` es demasiado (incluye `s3:GetObject`: leer datos). Los datos FinOps de la fase 1 usan `savingsplans:DescribeSavingsPlans`, `cost-optimization-hub:List*/GetPreferences`, `budgets:ViewBudget` e `invoicing:ListInvoiceSummaries` (la factura: de ahí sale la moneda de pago; DIVE guarda solo la tasa de cambio, no los totales). Si creaste el permission set antes, actualízalo con la policy nueva; sin esos permisos la fase 1 sigue y lo avisa.
 
 La policy también **niega explícitamente** lo que sí lee contenido aunque parezca metadato: valores de API keys de API Gateway, variables de entorno de task definitions de ECS y de Lambda (`GetFunctionConfiguration`), UserData (launch templates, launch configurations, spot), secretos, parámetros SSM, objetos S3, eventos de logs y outputs de CloudFormation. Esos `Deny` siguen valiendo aunque AWS amplíe `ViewOnlyAccess` en el futuro. Riesgo residual que no se puede cerrar sin romper el inventario: `lambda:ListFunctions`/`ListVersionsByFunction` devuelven las variables de entorno de Lambda, `glue:GetJobs` los `DefaultArguments` de los jobs y los stages de API Gateway sus stage variables. Los colectores descartan esos campos, pero quien tenga el rol puede verlos: no guardes secretos ahí.
 
@@ -91,7 +91,7 @@ bash dive.sh --config ~/clientes/acme/dive.config.yaml --sin-doctor --sin-dashbo
 bash dive.sh                                   # sin --config: busca dive.config.yaml en tu carpeta personal y pregunta
 ```
 
-Opciones: `--sin-doctor`, `--sin-precios` (precios estimados de us-east-1 en vez de la Price List API), `--sin-dashboard`, `--sin-navegador` (abre el dashboard sin abrir el navegador). Comprueba antes el entorno (venv, config, perfiles `dive-*`, sesión de AWS) y, si falta algo, dice el comando exacto para arreglarlo (si la sesión de AWS expiró, ofrece hacer el `aws sso login` ahí mismo). Corre las fases sobre una corrida nueva, se para en la primera que falle (indicando cómo retomar solo esa fase) y al final abre el dashboard.
+Opciones: `--sin-doctor`, `--sin-precios` (precios estimados de us-east-1 en vez de la Price List API), `--sin-finops` (sin Savings Plans, Cost Optimization Hub ni moneda de la factura), `--sin-dashboard`, `--sin-navegador` (abre el dashboard sin abrir el navegador). Comprueba antes el entorno (venv, config, perfiles `dive-*`, sesión de AWS) y, si falta algo, dice el comando exacto para arreglarlo (si la sesión de AWS expiró, ofrece hacer el `aws sso login` ahí mismo). Corre las fases sobre una corrida nueva, se para en la primera que falle (indicando cómo retomar solo esa fase) y al final abre el dashboard.
 
 #### Uso: correr las fases
 
@@ -165,9 +165,9 @@ Inventory of an AWS Organization with many accounts, in one afternoon, with AI a
 | Phase | Question | Source of truth | Deliverable |
 |---|---|---|---|
 | **0 · Prepare** | How do I get into every account safely? | IAM Identity Center | `DIVE_ReadOnly` permission set + `dive-*` profiles |
-| **D · Discover** | Where is something? How much do I pay? | Billing (Cost Explorer, 6 months) | `discovery.json` |
+| **D · Discover** | Where is something? How much do I pay? | Billing (Cost Explorer, 6 months) + Savings Plans, Cost Optimization Hub, anomalies and invoice currency | `discovery.json` |
 | **I · Inventory** | What exactly is there? | AWS APIs, only where billing shows cost | `inventory.json` |
-| **V · Validate** | Is it healthy? Does it match what I pay? | AWS Doctor + billing ↔ inventory cross-check + rules | `findings.json` / `findings.md` |
+| **V · Validate** | Is it healthy? Does it match what I pay? | AWS Doctor + Cost Optimization Hub + billing ↔ inventory cross-check + FinOps rules | `findings.json` / `findings.md` |
 | **E · Diagram** | What does it look like? | `inventory.json` | `.drawio` diagrams + `reporte.html` |
 | **5 · Dashboard** | What changed between runs? What did I already review? | all runs | local dashboard on 127.0.0.1 |
 | Anonymize | Can I show it? | all outputs | verified `-anon` folder |
@@ -210,7 +210,7 @@ cp dive.config.example.yaml dive.config.yaml   # and set management_profile, org
 
 #### Phase 0 · Prepare access
 
-The scan role is `ViewOnlyAccess` + [a minimal policy](setup/readonly-policy.json) with exactly what the collectors and aws-doctor need. `ViewOnlyAccess` alone falls short (no Cost Explorer, no Transit Gateway), and `ReadOnlyAccess` is too much (it includes `s3:GetObject`: reading data).
+The scan role is `ViewOnlyAccess` + [a minimal policy](setup/readonly-policy.json) with exactly what the collectors and aws-doctor need. `ViewOnlyAccess` alone falls short (no Cost Explorer, no Transit Gateway), and `ReadOnlyAccess` is too much (it includes `s3:GetObject`: reading data). Phase 1 FinOps data uses `savingsplans:DescribeSavingsPlans`, `cost-optimization-hub:List*/GetPreferences`, `budgets:ViewBudget` and `invoicing:ListInvoiceSummaries` (the invoice: that's where the payment currency comes from; DIVE keeps only the exchange rate, not the totals). If you created the permission set earlier, update it with the new policy; without these permissions phase 1 carries on and warns.
 
 The policy also **explicitly denies** what does read content even if it looks like metadata: API Gateway API key values, ECS task definition and Lambda environment variables (`GetFunctionConfiguration`), UserData (launch templates, launch configurations, spot), secrets, SSM parameters, S3 objects, log events and CloudFormation outputs. Those `Deny` statements keep working even if AWS widens `ViewOnlyAccess` in the future. Residual risk that cannot be closed without breaking the inventory: `lambda:ListFunctions`/`ListVersionsByFunction` return Lambda environment variables, `glue:GetJobs` returns the jobs' `DefaultArguments`, and API Gateway stages return their stage variables. Collectors drop those fields, but whoever holds the role can see them: don't keep secrets there.
 
@@ -240,7 +240,7 @@ bash dive.sh --config ~/clientes/acme/dive.config.yaml --sin-doctor --sin-dashbo
 bash dive.sh                                   # without --config: looks for dive.config.yaml in your home folder and asks
 ```
 
-Options: `--sin-doctor`, `--sin-precios` (us-east-1 estimated prices instead of the Price List API), `--sin-dashboard`, `--sin-navegador` (starts the dashboard without opening the browser). It first checks the environment (venv, config, `dive-*` profiles, AWS session) and, if something is missing, prints the exact command to fix it (if the AWS session expired, it offers to run `aws sso login` right there). It runs the phases on a new run, stops at the first one that fails (showing how to resume only that phase), and opens the dashboard at the end.
+Options: `--sin-doctor`, `--sin-precios` (us-east-1 estimated prices instead of the Price List API), `--sin-finops` (no Savings Plans, Cost Optimization Hub or invoice currency), `--sin-dashboard`, `--sin-navegador` (starts the dashboard without opening the browser). It first checks the environment (venv, config, `dive-*` profiles, AWS session) and, if something is missing, prints the exact command to fix it (if the AWS session expired, it offers to run `aws sso login` right there). It runs the phases on a new run, stops at the first one that fails (showing how to resume only that phase), and opens the dashboard at the end.
 
 #### Usage: running the phases
 
@@ -314,9 +314,9 @@ Inventário de uma AWS Organization com muitas contas, numa tarde, com IA como c
 | Fase | Pergunta | Fonte de verdade | Entregável |
 |---|---|---|---|
 | **0 · Preparar** | Como entro em todas as contas sem risco? | IAM Identity Center | permission set `DIVE_ReadOnly` + perfis `dive-*` |
-| **D · Descobrir** | Onde há alguma coisa? Quanto pago? | Billing (Cost Explorer, 6 meses) | `discovery.json` |
+| **D · Descobrir** | Onde há alguma coisa? Quanto pago? | Billing (Cost Explorer, 6 meses) + Savings Plans, Cost Optimization Hub, anomalias e moeda da fatura | `discovery.json` |
 | **I · Inventariar** | O que existe exatamente? | APIs da AWS, só onde o billing mostra custo | `inventory.json` |
-| **V · Validar** | Está saudável? Bate com o que pago? | AWS Doctor + cruzamento billing ↔ inventário + regras | `findings.json` / `findings.md` |
+| **V · Validar** | Está saudável? Bate com o que pago? | AWS Doctor + Cost Optimization Hub + cruzamento billing ↔ inventário + regras FinOps | `findings.json` / `findings.md` |
 | **E · Esquematizar** | Como fica? | `inventory.json` | diagramas `.drawio` + `reporte.html` |
 | **5 · Dashboard** | O que mudou entre execuções? O que já revisei? | todas as execuções | dashboard local em 127.0.0.1 |
 | Anonimizar | Posso mostrar? | todas as saídas | pasta `-anon` verificada |
@@ -359,7 +359,7 @@ cp dive.config.example.yaml dive.config.yaml   # e ajuste management_profile, or
 
 #### Fase 0 · Preparar o acesso
 
-O role de varredura é `ViewOnlyAccess` + [uma policy mínima](setup/readonly-policy.json) com exatamente o que os coletores e o aws-doctor pedem. `ViewOnlyAccess` sozinha não basta (não tem Cost Explorer nem Transit Gateway), e `ReadOnlyAccess` é demais (inclui `s3:GetObject`: ler dados).
+O role de varredura é `ViewOnlyAccess` + [uma policy mínima](setup/readonly-policy.json) com exatamente o que os coletores e o aws-doctor pedem. `ViewOnlyAccess` sozinha não basta (não tem Cost Explorer nem Transit Gateway), e `ReadOnlyAccess` é demais (inclui `s3:GetObject`: ler dados). Os dados FinOps da fase 1 usam `savingsplans:DescribeSavingsPlans`, `cost-optimization-hub:List*/GetPreferences`, `budgets:ViewBudget` e `invoicing:ListInvoiceSummaries` (a fatura: é daí que vem a moeda de pagamento; o DIVE guarda só a taxa de câmbio, não os totais). Se criaste o permission set antes, atualiza-o com a policy nova; sem essas permissões a fase 1 continua e avisa.
 
 A policy também **nega explicitamente** o que lê conteúdo, mesmo parecendo metadado: valores de API keys do API Gateway, variáveis de ambiente de task definitions do ECS e do Lambda (`GetFunctionConfiguration`), UserData (launch templates, launch configurations, spot), secrets, parâmetros SSM, objetos S3, eventos de logs e outputs do CloudFormation. Esses `Deny` continuam valendo mesmo que a AWS amplie o `ViewOnlyAccess` no futuro. Risco residual que não dá para fechar sem quebrar o inventário: `lambda:ListFunctions`/`ListVersionsByFunction` devolvem as variáveis de ambiente do Lambda, `glue:GetJobs` os `DefaultArguments` dos jobs e os stages do API Gateway as stage variables. Os coletores descartam esses campos, mas quem tiver o role consegue vê-los: não guarde segredos aí.
 
@@ -389,7 +389,7 @@ bash dive.sh --config ~/clientes/acme/dive.config.yaml --sin-doctor --sin-dashbo
 bash dive.sh                                   # sem --config: procura dive.config.yaml na sua pasta pessoal e pergunta
 ```
 
-Opções: `--sin-doctor`, `--sin-precios` (preços estimados de us-east-1 em vez da Price List API), `--sin-dashboard`, `--sin-navegador` (abre o dashboard sem abrir o navegador). Antes verifica o ambiente (venv, config, perfis `dive-*`, sessão da AWS) e, se faltar algo, mostra o comando exato para resolver (se a sessão da AWS expirou, oferece fazer o `aws sso login` ali mesmo). Roda as fases numa execução nova, para na primeira que falhar (mostrando como retomar só essa fase) e no fim abre o dashboard.
+Opções: `--sin-doctor`, `--sin-precios` (preços estimados de us-east-1 em vez da Price List API), `--sin-finops` (sem Savings Plans, Cost Optimization Hub nem moeda da fatura), `--sin-dashboard`, `--sin-navegador` (abre o dashboard sem abrir o navegador). Antes verifica o ambiente (venv, config, perfis `dive-*`, sessão da AWS) e, se faltar algo, mostra o comando exato para resolver (se a sessão da AWS expirou, oferece fazer o `aws sso login` ali mesmo). Roda as fases numa execução nova, para na primeira que falhar (mostrando como retomar só essa fase) e no fim abre o dashboard.
 
 #### Uso: rodar as fases
 

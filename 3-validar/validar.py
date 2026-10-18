@@ -3,14 +3,16 @@
 Lee discovery.json + inventory.json de la carpeta de salida y escribe ahí mismo
 findings.json (forma de CONTRATO.md) y findings.md (resumen ordenado por severidad y $).
 
-Tres fuentes:
-  a) aws-doctor  → doctor.py  (salida cruda en salida/<corrida>/aws-doctor/)
-  b) cruce-billing → este archivo: lo que se cobra y no está inventariado, servicios sin
+Fuentes:
+  a) cost-optimization-hub y finops → hallazgos_finops.py (de discovery["finops"]: recomendaciones de
+     Cost Optimization Hub, compromisos sin usar o por vencer, anomalías)
+  b) aws-doctor  → doctor.py  (salida cruda en salida/<corrida>/aws-doctor/)
+  c) cruce-billing → este archivo: lo que se cobra y no está inventariado, servicios sin
      colector y regiones sorpresa
-  c) regla       → reglas.py  (desperdicio y riesgo sobre los recursos inventariados)
+  d) regla       → reglas.py  (desperdicio y riesgo sobre los recursos inventariados)
 
 Uso: python 3-validar/validar.py [--inventory salida/<corrida>/inventory.json] [--discovery ...]
-                                 [--sin-doctor] [--timeout-doctor 900]
+                                 [--sin-doctor] [--timeout-doctor 900] [--sin-precios]
 """
 
 import argparse
@@ -27,9 +29,10 @@ sys.path.insert(0, str(RAIZ / "2-inventariar"))
 sys.path.insert(0, str(AQUI))
 
 from common import (SERVICIOS_GOBIERNO, _base_salida, ahora, cargar_config, corrida_actual, error_corto,  # noqa: E402
-                    escribir_json, heredar_run, leer_json)
+                    escribir_json, heredar_run, leer_json, moneda_de_pago)
 
 import doctor  # noqa: E402
+import hallazgos_finops  # noqa: E402
 import reglas  # noqa: E402
 from hallazgos import SEVERIDADES, completar_v2, hallazgo, severidad_por_costo  # noqa: E402
 
@@ -260,6 +263,16 @@ def _celda(texto):
     return html.escape(str(texto if texto is not None else "—"), quote=False).replace("|", "\\|").replace("\n", " ")
 
 
+def _en_moneda(discovery):
+    """Solo la tasa, sin el monto convertido: el anonimizador redondea montos en USD, no en otras monedas, y
+    con el monto exacto y la tasa se recuperaría el total exacto."""
+    m = moneda_de_pago(discovery)
+    if not m:
+        return ""
+    origen = f"factura de {m['periodo']}" if m["fuente"] == "invoice" else "config"
+    return f" (se paga en {m['codigo']}: tasa {m['tasa']:g} {m['codigo']} por dólar, {origen})"
+
+
 def generar_md(findings, discovery, errores):
     nombres = {a: c.get("name", a) for a, c in discovery["accounts"].items()}
     cuenta = lambda a: f"{nombres.get(a, a)} ({a})" if a else "varias"  # noqa: E731
@@ -267,7 +280,7 @@ def generar_md(findings, discovery, errores):
 
     lineas = ["# Findings · Método DIVE", "",
               f"Generado: {ahora()} · {len(findings)} findings · {len(discovery['accounts'])} cuentas", "",
-              f"Ahorro potencial estimado (desperdicio + costo): **${total:,.2f}/mes**. "
+              f"Ahorro potencial estimado (desperdicio + costo): **${total:,.2f}/mes**{_en_moneda(discovery)}. "
               "Es un tope: son estimaciones, y un recurso marcado como desperdicio no suma además su optimización.", "",
               "| Severidad | Findings | Ahorro $/mes |", "|---|---:|---:|"]
     for sev in SEVERIDADES:
@@ -364,6 +377,8 @@ def validar(cfg, discovery, inventory, salida, sin_doctor=False, timeout_doctor=
         findings += f_doc
         errores += e_doc
 
+    # Cost Optimization Hub primero: en el dedup, su monto (neto de compromisos) es el que cuenta para el recurso.
+    findings = hallazgos_finops.hallazgos(discovery, inventory) + hallazgos_finops.ajustar_por_compromisos(findings, discovery)
     findings += cruce_billing(discovery, inventory, cargar_colectores())
     findings += reglas.aplicar(inventory, precios)
     findings = ordenar_y_numerar(deduplicar(findings))

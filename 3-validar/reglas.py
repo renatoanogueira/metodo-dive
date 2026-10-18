@@ -556,6 +556,33 @@ def regla_s3_kms_sin_bucket_key(recursos, ctx):
     return out
 
 
+def regla_sin_budget(recursos, ctx):
+    """Cuenta con costo y sin ningún budget que la vigile: ni uno propio, ni uno de la management filtrado a
+    ella, ni uno de la management sin filtro de cuenta (vigila el total de la organización)."""
+    mgmt = ctx.get("management")
+    # Sin mirar la management no se puede afirmar nada de las miembro: ahí suelen estar los budgets centrales.
+    if not mgmt or (mgmt, "budgets") not in ctx.get("escaneado", set()) or (mgmt, "budgets") in ctx.get("fallado", set()):
+        return []
+    # Solo los de costo: uno de cobertura/uso de Savings Plans o RIs, o de uso, no vigila el gasto.
+    budgets = [r for r in recursos if _es(r, {"budgets"}, "budget") and _attrs(r).get("budget_type") == "COST"]
+    cubiertas = {r["account_id"] for r in budgets}
+    for r in budgets:
+        filtradas = _attrs(r).get("linked_accounts") or []
+        if r["account_id"] == mgmt and not filtradas and not _attrs(r).get("filtrado"):
+            return []  # un budget del total de la organización (sin ningún filtro)
+        cubiertas.update(filtradas)
+    out = []
+    for cuenta in sorted(ctx.get("cuentas") or {}):
+        if (cuenta in cubiertas or (cuenta, "budgets") not in ctx.get("escaneado", set())
+                or (cuenta, "budgets") in ctx.get("fallado", set())):
+            continue
+        out.append(hallazgo("riesgo", "baja", cuenta, None, None, "Cuenta sin AWS Budget",
+                            "Ningún budget la vigila (ni propio ni uno de la management filtrado a esta cuenta): un "
+                            "gasto que se dispara se ve recién en la factura. Un budget mensual con alerta al 80% y "
+                            "al 100% del pronóstico es gratis (los dos primeros por cuenta).", None, FUENTE))
+    return out
+
+
 REGLAS = [
     regla_ebs_sin_adjuntar,
     regla_eip_sin_asociar,
@@ -577,6 +604,7 @@ REGLAS = [
     regla_lambda_x86,
     regla_ec2_generacion_antigua,
     regla_s3_kms_sin_bucket_key,
+    regla_sin_budget,
 ]
 
 
@@ -584,7 +612,12 @@ def aplicar(inventory, precios=None):
     """Corre todas las reglas. La fecha de referencia es la del inventario (reproducible). `precios` es
     {región: {clave: precio}} de common.precios (o None: las reglas usan sus estimados de respaldo)."""
     ahora = parsear_fecha(inventory.get("generated_at")) or datetime.now(timezone.utc)
-    ctx = {"ahora": ahora, "precios": precios or {}}
+    ctx = {"ahora": ahora, "precios": precios or {},
+           # Dónde corrió cada colector sin error: una regla de "falta X" solo afirma donde se pudo mirar.
+           "escaneado": {(s.get("account_id"), s.get("collector")) for s in inventory.get("scanned") or []},
+           "fallado": {(e.get("account_id"), e.get("collector")) for e in inventory.get("errors") or []},
+           "cuentas": inventory.get("accounts") or {},
+           "management": (inventory.get("run") or {}).get("management_account_id")}
     recursos = inventory.get("resources", [])
     findings = []
     for regla in REGLAS:

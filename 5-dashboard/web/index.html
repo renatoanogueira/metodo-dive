@@ -17,6 +17,7 @@
       <label>Organización <select id="sel-org"></select></label>
       <label>Corrida <select id="sel-run"></select></label>
       <label>Cuenta <select id="sel-cuenta"><option value="">Todas las cuentas</option></select></label>
+      <label id="l-moneda" hidden>Moneda <select id="sel-moneda"></select></label>
       <button class="btn" id="btn-tema" type="button" aria-label="Cambiar tema">Tema</button>
     </div>
   </div>
@@ -74,7 +75,7 @@
       <div class="chips" id="h-sev" aria-label="Hallazgos por severidad"></div>
       <div class="meta" id="h-meta"></div>
       <div class="scroll"><table class="tabla">
-        <thead><tr><th>Sev.</th><th>Hallazgo</th><th>Cuenta</th><th>Recurso</th><th class="num">$/mes</th>
+        <thead><tr><th>Sev.</th><th>Hallazgo</th><th>Cuenta</th><th>Recurso</th><th class="num" id="th-mes">$/mes</th>
           <th>Historia</th><th>Estado</th></tr></thead>
         <tbody id="h-body"></tbody>
       </table></div>

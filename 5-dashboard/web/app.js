@@ -34,11 +34,35 @@
     Object.keys(attrs || {}).forEach(function (k) { e.setAttribute(k, attrs[k]); });
     return e;
   }
+  // Moneda de la factura (discovery.finops.moneda_pago): los datos están en USD y se convierten solo al
+  // mostrarlos, con la tasa de la última factura. estado.verUsd = el usuario prefirió ver USD.
+  var SIMBOLOS = { USD: "$", EUR: "€", GBP: "£", BRL: "R$", JPY: "¥", INR: "₹", AUD: "A$", CAD: "C$" };
+  function monedaVista() {
+    var m = estado.resumen && estado.resumen.run && estado.resumen.run.moneda;
+    return (m && m.codigo !== "USD" && !estado.verUsd) ? m : null;
+  }
+  function codigoVista() {
+    var m = monedaVista();
+    return m ? m.codigo : "USD";
+  }
   function dinero(v, decimales) {
     if (v == null || isNaN(v)) return "—";
     var d = decimales == null ? 2 : decimales;
-    var n = Number(v);
-    return (n < 0 ? "−$" : "$") + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+    var m = monedaVista();
+    var n = Number(v) * (m ? m.tasa : 1);
+    var s = m ? (SIMBOLOS[m.codigo] || m.codigo + " ") : "$";
+    return (n < 0 ? "−" : "") + s + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+  function pintarMoneda() {
+    var m = estado.resumen && estado.resumen.run && estado.resumen.run.moneda, sel = $("sel-moneda");
+    $("th-mes").textContent = (SIMBOLOS[codigoVista()] || codigoVista() + " ") + "/mes";
+    $("l-moneda").hidden = !(m && m.codigo !== "USD");
+    if ($("l-moneda").hidden) return;
+    sel.textContent = "";
+    var origen = m.fuente === "invoice" ? "factura " + (m.periodo || "") : "config";
+    sel.appendChild(el("option", { value: m.codigo, text: m.codigo + " (1 USD = " + m.tasa.toFixed(4) + ", " + origen + ")" }));
+    sel.appendChild(el("option", { value: "USD", text: "USD (sin convertir)" }));
+    sel.value = estado.verUsd ? "USD" : m.codigo;
   }
   function sevClase(s) { return ["alta", "media", "baja"].indexOf(s) >= 0 ? s : "baja"; }
   function nombreCuenta(id) {
@@ -179,7 +203,7 @@
     cuerpo.appendChild(el("tr", {}, [el("td", {}, [el("b", { text: "Factura del mes" })]),
                                      el("td", { class: "num" }, [el("b", { text: dinero(r.factura_ultimo_mes) })])]));
     return el("div", { class: "panel scroll" }, [el("table", { class: "tabla" }, [
-      el("thead", {}, [el("tr", {}, [el("th", { text: "Concepto (" + (r.ultimo_mes || "") + ")" }), el("th", { class: "num", text: "USD" })])]), cuerpo])]);
+      el("thead", {}, [el("tr", {}, [el("th", { text: "Concepto (" + (r.ultimo_mes || "") + ")" }), el("th", { class: "num", text: codigoVista() })])]), cuerpo])]);
   }
 
   function tablaMensual(r) {
@@ -206,7 +230,7 @@
     cont.textContent = "";
     if (!r) { cont.appendChild(el("div", { class: "vacio", text: "Sin datos para esta corrida." })); return; }
     var aviso = r.run.sin_doctor ? " · corrida sin aws-doctor: el ahorro y los hallazgos son parciales" : "";
-    var v = r.ventana, moneda = r.run.currency || "";
+    var v = r.ventana, moneda = codigoVista();
     var servicios = {};
     r.recursos_por_servicio.forEach(function (x) { servicios[x.service] = 1; });
     cont.appendChild(el("h2", { class: "grupo", text: "Inventario" }));
@@ -509,6 +533,7 @@
                         api("/api/recursos?" + p)]).then(function (res) {
       if (mia !== generacion) return;
       estado.resumen = res[0];
+      pintarMoneda();
       estado.hallazgos = res[1];
       estado.recursos = res[2];
       estado.pagina = 0;
@@ -572,6 +597,12 @@
     $("sel-org").addEventListener("change", function (e) { estado.org = e.target.value; estado.cuenta = ""; cargarOrg().catch(fallo); });
     $("sel-run").addEventListener("change", function (e) { estado.run = e.target.value; cargarRun().catch(fallo); });
     $("sel-cuenta").addEventListener("change", function (e) { estado.cuenta = e.target.value; cargarRun().catch(fallo); });
+    try { estado.verUsd = localStorage.getItem("dive-ver-usd") === "1"; } catch (e) { /* sin storage */ }
+    $("sel-moneda").addEventListener("change", function (e) {
+      estado.verUsd = e.target.value === "USD";
+      try { localStorage.setItem("dive-ver-usd", estado.verUsd ? "1" : "0"); } catch (err) { /* sin storage */ }
+      pintarMoneda(); pintarResumen(); pintarRecursos(); pintarHallazgos(); pintarCorridas();
+    });
     ["r-reg", "r-svc", "r-tipo", "r-hall"].forEach(function (id) {
       $(id).addEventListener("change", function () { estado.pagina = 0; pintarRecursos(); });
     });

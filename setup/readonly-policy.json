@@ -10,7 +10,13 @@
         "ce:List*",
         "pricing:GetProducts",
         "pricing:DescribeServices",
-        "pricing:GetAttributeValues"
+        "pricing:GetAttributeValues",
+        "budgets:ViewBudget",
+        "savingsplans:DescribeSavingsPlans",
+        "cost-optimization-hub:ListEnrollmentStatuses",
+        "cost-optimization-hub:GetPreferences",
+        "cost-optimization-hub:ListRecommendations",
+        "invoicing:ListInvoiceSummaries"
       ],
       "Resource": "*"
     },
