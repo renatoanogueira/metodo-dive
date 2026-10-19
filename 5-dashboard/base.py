@@ -4,12 +4,18 @@ Las corridas son de solo lectura; lo único que el usuario edita es `estado` (ac
 guarda por organización + fingerprint y sobrevive a cualquier corrida nueva. Sin dependencias: sqlite3.
 """
 
+import hashlib
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 from common import moneda_de_pago
+from common.verificacion import (MAX_ARCHIVO, cargar_json, existe_en_carpeta, leer_archivo_seguro,  # noqa: F401
+                                 leer_en_carpeta, revisar)
+
+MAX_JSON_CORRIDA = 500_000_000  # bytes: inventory.json de una organización grande
 
 ESTADOS = ("abierto", "aceptado", "ignorado", "resuelto")
 MAX_NOTA = 2000
@@ -41,14 +47,22 @@ CREATE TABLE IF NOT EXISTS estado (
     org_id TEXT, fingerprint TEXT, status TEXT NOT NULL, nota TEXT, updated_at TEXT,
     PRIMARY KEY (org_id, fingerprint)
 );
+-- Lo que la skill metodo-dive verificó de cada finding (verificacion.json de la corrida). firma = hash del archivo:
+-- se relee si cambia aunque la corrida ya estuviera ingerida (la skill lo escribe después de validar).
+CREATE TABLE IF NOT EXISTS verificaciones (
+    run_id TEXT, fingerprint TEXT, estado TEXT, motivo TEXT, pregunta TEXT, evidencia TEXT,
+    PRIMARY KEY (run_id, fingerprint)
+);
+CREATE TABLE IF NOT EXISTS verif_archivo (run_id TEXT PRIMARY KEY, firma TEXT);
 CREATE INDEX IF NOT EXISTS i_findings_fp ON findings (fingerprint);
 CREATE INDEX IF NOT EXISTS i_costos_run ON costos (run_id);
 CREATE INDEX IF NOT EXISTS i_usos_run ON usos (run_id);
 """
 
 
-VERSION_ESQUEMA = 5  # 2: recursos; 3: cargos; 4: uso_total; 5: moneda. Al subirla, las corridas se reingieren (el estado
-TABLAS_CORRIDA = ("runs", "cuentas", "costos", "usos", "findings", "sin_verificar", "recursos", "cargos", "uso_total")
+VERSION_ESQUEMA = 6  # 2: recursos; 3: cargos; 4: uso_total; 5: moneda; 6: verificaciones. Al subirla, las corridas se reingieren (el estado
+TABLAS_CORRIDA = ("runs", "cuentas", "costos", "usos", "findings", "sin_verificar", "recursos", "cargos", "uso_total",
+                  "verificaciones", "verif_archivo")
 # del usuario, tabla estado, se conserva).
 
 
@@ -69,9 +83,11 @@ def conectar(ruta):
 
 
 def _leer(ruta):
+    """JSON de un archivo de la corrida, sin seguir symlinks ni aceptar NaN o anidamientos patológicos."""
+    crudo = leer_archivo_seguro(ruta, MAX_JSON_CORRIDA)
     try:
-        return json.loads(Path(ruta).read_text())
-    except (OSError, ValueError):
+        return cargar_json(crudo) if crudo is not None else None
+    except ValueError:
         return None
 
 
@@ -81,7 +97,9 @@ def ingerir(con, carpetas_base):
     ya = {r[0]: r[1] for r in con.execute("SELECT run_id, generated_at FROM runs")}
     nuevas, omitidas = [], []
     for base in carpetas_base:
-        for carpeta in sorted(p for p in Path(base).iterdir() if p.is_dir() and not p.name.endswith("-anon")):
+        # Un symlink no es una corrida: la carpeta tiene que estar dentro de output_dir (lo que se sirve sale de ahí).
+        for carpeta in sorted(p for p in Path(base).iterdir()
+                              if p.is_dir() and not p.is_symlink() and not p.name.endswith("-anon")):
             findings = _leer(carpeta / "findings.json")
             if findings is None:
                 continue
@@ -95,6 +113,7 @@ def ingerir(con, carpetas_base):
                 omitidas.append(f"{carpeta.name} (mismo run_id que otra organización)")
                 continue
             if rid in ya and ya[rid] == findings.get("generated_at"):
+                _ingerir_verificacion(con, carpeta, rid)  # la skill puede haberla escrito después
                 continue
             # Nueva, o re-validada (otro generated_at, ej. validar con aws-doctor tras un --sin-doctor): se rehace
             # entera. El estado del usuario no se toca: va por fingerprint.
@@ -105,19 +124,49 @@ def ingerir(con, carpetas_base):
                 _ingerir_corrida(con, carpeta, run, findings, _dict(_leer(carpeta / "discovery.json")),
                                  _dict(_leer(carpeta / "inventory.json")))
                 con.execute("RELEASE corrida")
-            except (AttributeError, TypeError, KeyError, ValueError, sqlite3.Error):
+            except (AttributeError, TypeError, KeyError, ValueError, OverflowError, sqlite3.Error):
                 con.execute("ROLLBACK TO corrida")
                 con.execute("RELEASE corrida")
                 omitidas.append(carpeta.name)
                 continue
             ya[rid] = findings.get("generated_at")
             nuevas.append(rid)
+            _ingerir_verificacion(con, carpeta, rid)
     con.commit()
     return nuevas, omitidas
 
 
 def _dict(x):
     return x if isinstance(x, dict) else {}
+
+
+def _ingerir_verificacion(con, carpeta, rid):
+    """verificacion.json de la skill, si cambió desde la última vez. Las mismas reglas que el validador
+    (common/verificacion.py): un archivo con cualquier problema no se muestra, ni a medias. No sigue symlinks."""
+    try:
+        crudo = leer_en_carpeta(carpeta, "verificacion.json", MAX_ARCHIVO) or b""
+        firma = hashlib.sha256(crudo).hexdigest() if crudo else None
+        previa = con.execute("SELECT firma FROM verif_archivo WHERE run_id = ?", (rid,)).fetchone()
+        if (previa[0] if previa else None) == firma:
+            return
+        con.execute("DELETE FROM verificaciones WHERE run_id = ?", (rid,))
+        con.execute("DELETE FROM verif_archivo WHERE run_id = ?", (rid,))
+        if firma:
+            con.execute("INSERT INTO verif_archivo VALUES (?,?)", (rid, firma))
+            try:
+                datos = cargar_json(crudo)
+            except ValueError:
+                datos = None
+            por_fp = {r["fingerprint"]: dict(r) for r in con.execute(
+                "SELECT fingerprint, id, rule_id, issue_id, is_saving, monthly_usd FROM findings WHERE run_id = ?", (rid,))}
+            validos, problemas = revisar(datos, rid, por_fp)
+            if not problemas:
+                con.executemany("INSERT INTO verificaciones VALUES (?,?,?,?,?,?)",
+                                [(rid, it["fingerprint"], it["estado"], it.get("motivo"), it.get("pregunta_dueno"),
+                                  it.get("evidencia")) for it in validos])
+        con.commit()
+    except sqlite3.Error:
+        con.rollback()  # base ocupada: se reintenta en la próxima recarga
 
 
 SECCIONES_FINOPS = ("savings_plans", "reservas", "anomalias", "hub_optimizacion")
@@ -329,6 +378,13 @@ def hallazgos(con, org_id, run_id):
                                 ON f.fingerprint = u.fingerprint AND f.run_id = u.m""", previas):
         ultimos[fila["fingerprint"]] = dict(fila)
 
+    # La verificación más reciente de cada fingerprint hasta esta corrida (la de una corrida anterior sigue
+    # valiendo, con su fecha, mientras el finding exista).
+    verif = {}
+    for fila in con.execute(f"""SELECT v.* FROM verificaciones v JOIN (SELECT fingerprint, MAX(run_id) m
+                                FROM verificaciones WHERE run_id IN ({marcas}) GROUP BY fingerprint) u
+                                ON v.fingerprint = u.fingerprint AND v.run_id = u.m""", previas):
+        verif[fila["fingerprint"]] = dict(fila)
     actuales = {f["fingerprint"]: dict(f) for f in con.execute("SELECT * FROM findings WHERE run_id = ?", (run_id,))}
     salida = []
     for fp, f in actuales.items():
@@ -352,6 +408,12 @@ def hallazgos(con, org_id, run_id):
                  nuevo=f["presencia"] == "presente" and h["primera"] == run_id and len(previas) > 1,
                  estado=e.get("status") or "abierto", nota=e.get("nota") or "", estado_fecha=e.get("updated_at"))
         f["reaparece"] = f["presencia"] == "presente" and f["estado"] == "resuelto"
+        v = verif.get(f["fingerprint"])
+        # vigente: verificada en esta corrida. Una de una corrida anterior se muestra con su fecha, pero no cuenta
+        # en "ahorro seguro ya": el recurso pudo cambiar desde entonces.
+        f["verificacion"] = ({"estado": v["estado"], "motivo": v["motivo"], "pregunta": v["pregunta"],
+                              "evidencia": v["evidencia"], "corrida": v["run_id"], "vigente": v["run_id"] == run_id}
+                             if v else None)
     orden = {"alta": 0, "media": 1, "baja": 2}
     salida.sort(key=lambda f: (f["presencia"] != "presente", orden.get(f["severity"], 9), -(f["monthly_usd"] or 0)))
     return salida
@@ -436,6 +498,14 @@ def resumen(con, org_id, run_id, cuenta=None):
         # Resueltos en ESTA corrida (simétrico con "nuevos"); los de antes siguen en la lista con su fecha.
         "resueltos": sum(1 for f in lista if f["presencia"] == "resuelto" and f.get("resuelto_en") == run_id),
         "no_verificados": sum(1 for f in lista if f["presencia"] == "no_verificado"),
+        # De lo abierto, lo que la skill verificó como reversible y seguro (None si nunca se verificó nada).
+        # Solo lo verificado en ESTA corrida (None si la skill no verificó nada en ella).
+        "ahorro_seguro_ya": (round(sum(f["monthly_usd"] or 0 for f in abiertos if f["is_saving"]
+                                       and (f.get("verificacion") or {}).get("estado") == "seguro_ya"
+                                       and f["verificacion"]["vigente"]), 2)
+                             if any((f.get("verificacion") or {}).get("vigente") and f["presencia"] == "presente"
+                                    for f in lista) else None),
+        "tiene_informe": bool(run["carpeta"]) and existe_en_carpeta(run["carpeta"], "informe-finops.md", MAX_INFORME),
         "por_cuenta_mes": por_cuenta_mes,
         "servicios": servicios,
         "usos": usos,
@@ -484,6 +554,19 @@ def guardar_estado(con, org_id, fingerprint, status, nota):
                 (org_id, fingerprint, status, nota, ahora))
     con.commit()
     return {"org_id": org_id, "fingerprint": fingerprint, "status": status, "nota": nota, "updated_at": ahora}
+
+
+MAX_INFORME = 1_000_000  # bytes
+
+
+def informe(con, org_id, run_id):
+    """Texto de informe-finops.md de una corrida de esta organización, o None. La carpeta sale de la base (nunca
+    de la URL) y el texto se muestra como texto plano en el panel: no se interpreta como HTML."""
+    fila = con.execute("SELECT carpeta FROM runs WHERE run_id = ? AND org_id = ?", (run_id, org_id)).fetchone()
+    if not fila or not fila[0]:
+        return None
+    crudo = leer_en_carpeta(fila[0], "informe-finops.md", MAX_INFORME)  # sin symlinks (ni en la carpeta) ni hardlinks
+    return crudo.decode("utf-8", errors="replace") if crudo is not None else None
 
 
 def carpeta_de(con, run_id):

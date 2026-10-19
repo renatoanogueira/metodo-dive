@@ -197,7 +197,7 @@ echo "  Para compartirla: $PY \"$RAIZ/anonimizar/anonimizar.py\" \"$CORRIDA\""
 # ---------- dashboard ----------
 
 if $SIN_DASHBOARD; then
-  echo "  Dashboard: $PY \"$RAIZ/5-dashboard/dashboard.py\""
+  echo "  Dashboard: $PY \"$RAIZ/5-dashboard/dashboard.py\" --config \"$CONFIG\""
   exit 0
 fi
 DASH_ARGS=()

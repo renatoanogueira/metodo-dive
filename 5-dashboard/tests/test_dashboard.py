@@ -362,3 +362,143 @@ def test_sin_budget_no_se_resuelve_si_no_se_miro_la_management(tmp_path):
     base.ingerir(con, [tmp_path])
     assert _por_fp(base.hallazgos(con, ORG, "2026-10-02T000000Z"))["g"]["presencia"] == "no_verificado"
     assert _por_fp(base.hallazgos(con, ORG, "2026-10-03T000000Z"))["g"]["presencia"] == "resuelto"
+
+
+def test_verificacion_de_la_skill_en_el_panel(tmp_path):
+    a = _f("a" * 16, "volumen suelto")
+    a.update(rule_id="regla.ebs_sin_adjuntar", issue_id="ebs.unattached")          # reversible
+    b = _f("b" * 16, "eip", cat="desperdicio")
+    b.update(rule_id="regla.eip_sin_asociar", issue_id="eip.unassociated")         # irreversible
+    info = _f("c" * 16, "ipv4", cat="costo")
+    info["is_saving"] = False
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b, info])
+    _corrida(tmp_path, "2026-10-02T000000Z", [a, b, info])
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    r = base.resumen(con, ORG, "2026-10-01T000000Z")
+    assert r["ahorro_seguro_ya"] is None and not r["tiene_informe"]   # sin verificación todavía
+
+    def escribir(items):
+        (c1 / "verificacion.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "items": items}))
+        base.ingerir(con, [tmp_path])
+        return _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))
+
+    # La skill escribe verificacion.json e informe-finops.md DESPUÉS: el panel los toma sin reingerir la corrida.
+    h = escribir([{"fingerprint": "a" * 16, "estado": "seguro_ya", "motivo": "available, sin uso", "evidencia": "describe-volumes"},
+                  {"fingerprint": "b" * 16, "estado": "firma", "motivo": "irreversible", "pregunta_dueno": "¿allowlist?"}])
+    (c1 / "informe-finops.md").write_text("# Informe\n<script>alert(1)</script>\n")
+    base.ingerir(con, [tmp_path])
+    assert h["a"]["verificacion"]["estado"] == "seguro_ya" and h["a"]["verificacion"]["vigente"]
+    assert h["b"]["verificacion"]["pregunta"] == "¿allowlist?" and h["c"]["verificacion"] is None
+    r = base.resumen(con, ORG, "2026-10-01T000000Z")
+    assert r["ahorro_seguro_ya"] == 10.0 and r["tiene_informe"]
+    assert base.informe(con, ORG, "2026-10-01T000000Z").startswith("# Informe")
+    assert base.informe(con, "o-otraorg123", "2026-10-01T000000Z") is None        # otra organización
+
+    # En la corrida siguiente se ve, con su fecha, pero no cuenta en "seguro ya": nadie la re-verificó.
+    h2 = _por_fp(base.hallazgos(con, ORG, "2026-10-02T000000Z"))
+    assert h2["a"]["verificacion"]["corrida"] == "2026-10-01T000000Z" and not h2["a"]["verificacion"]["vigente"]
+    assert base.resumen(con, ORG, "2026-10-02T000000Z")["ahorro_seguro_ya"] is None
+
+    # Las mismas reglas que el validador: un archivo con cualquier ítem inválido no se muestra, ni a medias.
+    for malo in ({"fingerprint": "b" * 16, "estado": "seguro_ya", "motivo": "x"},       # EIP: irreversible
+                 {"fingerprint": "c" * 16, "estado": "seguro_ya", "motivo": "x"},       # IPv4: no suma
+                 {"fingerprint": "f" * 16, "estado": "firma", "motivo": "x"},           # no es de esta corrida
+                 {"fingerprint": "a" * 16, "estado": "firma"}):                         # sin motivo
+        h = escribir([{"fingerprint": "a" * 16, "estado": "seguro_ya", "motivo": "ok"}, malo]
+                     if malo["fingerprint"] != "a" * 16 else [malo])
+        assert all(x["verificacion"] is None for x in h.values()), malo
+
+    # Si la reescribe, se relee; si la borra, se olvida.
+    h = escribir([{"fingerprint": "a" * 16, "estado": "contradicho", "motivo": "tiene tráfico"}])
+    assert h["a"]["verificacion"]["estado"] == "contradicho"
+    (c1 / "verificacion.json").unlink()
+    base.ingerir(con, [tmp_path])
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))["a"]["verificacion"] is None
+
+
+def test_no_sigue_symlinks_ni_hardlinks(tmp_path):
+    import os
+    secreto = tmp_path / "fuera" / "credentials"
+    secreto.parent.mkdir()
+    secreto.write_text("SECRETO")
+    corridas = tmp_path / "runs"
+    corridas.mkdir()
+    c = _corrida(corridas, "2026-10-01T000000Z", [_f("a" * 16, "x")])
+    (c / "informe-finops.md").symlink_to(secreto)
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [corridas])
+    assert base.informe(con, ORG, "2026-10-01T000000Z") is None
+    assert not base.resumen(con, ORG, "2026-10-01T000000Z")["tiene_informe"]
+    (c / "informe-finops.md").unlink()
+    os.link(secreto, c / "informe-finops.md")                                     # hardlink: tampoco
+    assert base.informe(con, ORG, "2026-10-01T000000Z") is None
+    # Una carpeta de corrida que es un symlink no se ingiere.
+    otra = tmp_path / "fuera" / "2026-10-02T000000Z"
+    _corrida(tmp_path / "fuera", "2026-10-02T000000Z", [_f("b" * 16, "y")])
+    (corridas / "2026-10-02T000000Z").symlink_to(otra)
+    base.ingerir(con, [corridas])
+    assert "2026-10-02T000000Z" not in [r[0] for r in con.execute("SELECT run_id FROM runs")]
+
+
+def test_servidor_informe_con_token_y_como_json(servidor, tmp_path):
+    p = servidor
+    (tmp_path / "2026-10-03T000000Z" / "informe-finops.md").write_text("# Informe\n<script>alert(1)</script>")
+    ruta = f"/api/informe?org={ORG}&run=2026-10-03T000000Z"
+    assert _pedir(p, "GET", ruta)[0] == 403                                            # sin token
+    estado, headers, cuerpo = _pedir(p, "GET", ruta, {"X-DIVE-Token": "TOKEN123"})
+    assert estado == 200 and headers["Content-Type"].startswith("application/json")
+    assert json.loads(cuerpo)["texto"].startswith("# Informe")                      # el panel usa textContent
+    assert _pedir(p, "GET", f"/api/informe?org={ORG}&run=../../etc", {"X-DIVE-Token": "TOKEN123"})[0] == 404
+    assert _pedir(p, "GET", f"/api/informe?org={ORG}&run=2026-10-01T000000Z", {"X-DIVE-Token": "TOKEN123"})[0] == 404
+
+
+def test_fifo_json_patologico_y_carpeta_cambiada_por_link(tmp_path):
+    import os
+    corridas = tmp_path / "runs"
+    corridas.mkdir()
+    c = _corrida(corridas, "2026-10-01T000000Z", [_f("a" * 16, "x")])
+    os.mkfifo(c / "verificacion.json")                       # un FIFO no bloquea la ingesta
+    os.mkfifo(c / "informe-finops.md")
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [corridas])
+    assert not base.resumen(con, ORG, "2026-10-01T000000Z")["tiene_informe"]
+    (c / "verificacion.json").unlink()
+    (c / "verificacion.json").write_text("[" * 200000)       # RecursionError: no tumba el panel
+    base.ingerir(con, [corridas])
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))["a"]["verificacion"] is None
+    # La carpeta de la corrida se cambia por un link después de la ingesta: el panel no sigue el link.
+    (c / "informe-finops.md").unlink()
+    afuera = tmp_path / "afuera"
+    afuera.mkdir()
+    (afuera / "informe-finops.md").write_text("PLANTADO")
+    c.rename(tmp_path / "movida")
+    c.symlink_to(afuera)
+    assert base.informe(con, ORG, "2026-10-01T000000Z") is None
+
+
+def test_lectura_rechaza_archivo_que_cambia_y_nombres_con_ruta(tmp_path, monkeypatch):
+    import os
+    from common import verificacion as v
+    (tmp_path / "a.json").write_text("0123456789")
+    assert v.leer_en_carpeta(tmp_path, "a.json", 100) == b"0123456789"
+    assert v.leer_en_carpeta(tmp_path, "../" + tmp_path.name + "/a.json", 100) is None
+    assert v.leer_en_carpeta(tmp_path, str(tmp_path / "a.json"), 100) is None
+    assert v.existe_en_carpeta(tmp_path, "a.json", 100) and not v.existe_en_carpeta(tmp_path, "a.json", 5)
+    real = os.fstat
+
+    class St:  # el archivo "creció" entre fstat y la lectura
+        def __init__(self, st):
+            self.st_mode, self.st_nlink, self.st_size = st.st_mode, st.st_nlink, st.st_size - 5
+    monkeypatch.setattr(v.os, "fstat", lambda fd: St(real(fd)))
+    assert v.leer_en_carpeta(tmp_path, "a.json", 100) is None
+
+
+def test_findings_con_entero_gigante_no_tumba_la_ingesta(tmp_path):
+    malo = _corrida(tmp_path, "2026-10-01T000000Z", [_f("a" * 16, "x")])
+    (malo / "findings.json").write_text((malo / "findings.json").read_text().replace('"monthly_usd": 10.0',
+                                                                                     '"monthly_usd": 1e999'))
+    _corrida(tmp_path, "2026-10-02T000000Z", [_f("b" * 16, "y")])
+    con = base.conectar(tmp_path / "db.sqlite")
+    nuevas, _ = base.ingerir(con, [tmp_path])
+    assert nuevas == ["2026-10-02T000000Z"]          # la rota se omite; las demás entran igual

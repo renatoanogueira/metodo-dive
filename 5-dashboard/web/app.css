@@ -70,6 +70,12 @@ table.tabla{border-collapse:collapse;width:100%}
 .tag{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;border:1px solid var(--border);color:var(--text-secondary);margin-right:4px;white-space:nowrap}
 .tag.nuevo{border-color:var(--accent);color:var(--accent)}
 .tag.reaparece{border-color:var(--alta);color:var(--alta)}
+.tag.v-seguro_ya{border-color:var(--baja);color:var(--baja)}
+.tag.v-firma{border-color:var(--media);color:var(--media)}
+.tag.v-contradicho{border-color:var(--alta);color:var(--alta)}
+.verif.vieja{opacity:.75}
+.verif{margin-top:4px;font-size:12px;color:var(--text-secondary)}
+pre.informe{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.45;margin:0}
 .detalle{color:var(--text-secondary);font-size:12px;margin-top:4px;overflow-wrap:anywhere}
 .estado select{min-height:30px;padding:2px 6px}
 .estado textarea{display:block;width:100%;min-height:52px;margin-top:6px;font-size:12px}

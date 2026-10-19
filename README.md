@@ -128,6 +128,20 @@ Abre el navegador solo, en `http://127.0.0.1:8765/#t=<token>` (si el puerto est�
 | Hallazgos | Contador por severidad; historia entre corridas (nuevo, resuelto, no verificado); estado editable (abierto, aceptado, ignorado, resuelto) que se guarda por fingerprint |
 | Corridas | Cada corrida con su tipo, errores y su `reporte.html` |
 
+#### Uso: skill para Claude Code
+
+`skill/` es una skill que corre `dive.sh` (solo lectura), lee la corrida y escribe `informe-finops.md` en su carpeta. El informe trae:
+- dos totales: "ahorro seguro ya" (reversible y re-verificado en AWS) y "máximo teórico";
+- cada ítem con su evidencia y su confianza, si es reversible y el comando para que lo ejecute una persona.
+
+La skill nunca cambia nada en AWS. Para instalarla:
+
+```bash
+mkdir -p ~/.claude/skills && ln -s "$PWD/skill" ~/.claude/skills/metodo-dive
+```
+
+Después, en Claude Code: "audita los costos de la organización con DIVE" o "prioriza los findings de la última corrida".
+
 #### Cobertura: qué tan completo es el inventario
 
 `3-validar/cobertura.py` compara el inventario contra la Tagging API, un oráculo independiente de los colectores, y genera `tareas_extra` para volver a correr la fase 2 sobre lo que el billing no mostró (típicamente lo que está en free tier).
@@ -148,7 +162,7 @@ Cada colector es un archivo en `2-inventariar/colectores/` con `NAME`, `TRIGGERS
 #### Tests
 
 ```bash
-.venv/bin/python -m pytest -q 2-inventariar/tests 3-validar/tests 4-esquematizar/tests anonimizar/tests 5-dashboard/tests
+.venv/bin/python -m pytest -q 1-descubrir/tests 2-inventariar/tests 3-validar/tests 4-esquematizar/tests anonimizar/tests 5-dashboard/tests skill/tests
 ```
 
 Todos usan `botocore.stub.Stubber` o fixtures sintéticas: ningún test llama a AWS.
@@ -277,6 +291,20 @@ It opens the browser by itself at `http://127.0.0.1:8765/#t=<token>` (if the por
 | Hallazgos | Count by severity; history between runs (new, resolved, not verified); editable state (open, accepted, ignored, resolved) saved per fingerprint |
 | Corridas | Each run with its type, errors and its `reporte.html` |
 
+#### Usage: Claude Code skill
+
+`skill/` is a skill that runs `dive.sh` (read-only), reads the run and writes `informe-finops.md` in its folder. The report has:
+- two totals: "save now safely" (reversible and re-verified in AWS) and "maximum theoretical";
+- each item with its evidence and confidence, whether it's reversible, and the command for a person to run.
+
+The skill never changes anything in AWS. To install it:
+
+```bash
+mkdir -p ~/.claude/skills && ln -s "$PWD/skill" ~/.claude/skills/metodo-dive
+```
+
+Then, in Claude Code: "audit the organization's costs with DIVE" or "prioritize the findings of the last run".
+
 #### Coverage: how complete is the inventory
 
 `3-validar/cobertura.py` compares the inventory against the Tagging API, an oracle independent of the collectors, and produces `tareas_extra` to rerun phase 2 on what billing didn't show (typically free-tier resources).
@@ -297,7 +325,7 @@ Each collector is a file in `2-inventariar/colectores/` with `NAME`, `TRIGGERS` 
 #### Tests
 
 ```bash
-.venv/bin/python -m pytest -q 2-inventariar/tests 3-validar/tests 4-esquematizar/tests anonimizar/tests 5-dashboard/tests
+.venv/bin/python -m pytest -q 1-descubrir/tests 2-inventariar/tests 3-validar/tests 4-esquematizar/tests anonimizar/tests 5-dashboard/tests skill/tests
 ```
 
 All of them use `botocore.stub.Stubber` or synthetic fixtures: no test calls AWS.
@@ -426,6 +454,20 @@ Abre o navegador sozinho em `http://127.0.0.1:8765/#t=<token>` (se a porta estiv
 | Hallazgos | Contador por severidade; histórico entre execuções (novo, resolvido, não verificado); estado editável (aberto, aceito, ignorado, resolvido) salvo por fingerprint |
 | Corridas | Cada execução com o tipo, os erros e o `reporte.html` |
 
+#### Uso: skill para o Claude Code
+
+`skill/` é uma skill que roda o `dive.sh` (só leitura), lê a execução e escreve `informe-finops.md` na pasta dela. O relatório traz:
+- dois totais: "economia segura já" (reversível e re-verificada na AWS) e "máximo teórico";
+- cada item com a sua evidência e confiança, se é reversível e o comando para uma pessoa executar.
+
+A skill nunca altera nada na AWS. Para instalar:
+
+```bash
+mkdir -p ~/.claude/skills && ln -s "$PWD/skill" ~/.claude/skills/metodo-dive
+```
+
+Depois, no Claude Code: "audita os custos da organização com o DIVE" ou "prioriza os findings da última execução".
+
 #### Cobertura: quão completo é o inventário
 
 `3-validar/cobertura.py` compara o inventário com a Tagging API, um oráculo independente dos coletores, e gera `tareas_extra` para rodar de novo a fase 2 sobre o que o billing não mostrou (normalmente o que está no free tier).
@@ -446,7 +488,7 @@ Cada coletor é um arquivo em `2-inventariar/colectores/` com `NAME`, `TRIGGERS`
 #### Testes
 
 ```bash
-.venv/bin/python -m pytest -q 2-inventariar/tests 3-validar/tests 4-esquematizar/tests anonimizar/tests 5-dashboard/tests
+.venv/bin/python -m pytest -q 1-descubrir/tests 2-inventariar/tests 3-validar/tests 4-esquematizar/tests anonimizar/tests 5-dashboard/tests skill/tests
 ```
 
 Todos usam `botocore.stub.Stubber` ou fixtures sintéticas: nenhum teste chama a AWS.

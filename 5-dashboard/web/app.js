@@ -255,6 +255,8 @@
     cont.appendChild(el("h2", { class: "grupo", text: "Hallazgos" }));
     cont.appendChild(el("div", { class: "cards" }, [
       tarjeta("Ahorro potencial / mes", dinero(r.ahorro_abierto, 0), "estimado; sin aceptados ni ignorados" + aviso),
+      r.ahorro_seguro_ya != null ? tarjeta("Ahorro seguro ya / mes", dinero(r.ahorro_seguro_ya, 0),
+        "reversible y re-verificado por la skill metodo-dive") : null,
       tarjeta("Altos abiertos", String(r.altos_abiertos), r.abiertos + " hallazgos abiertos"),
       tarjeta("Cambios", "+" + r.nuevos + " / −" + r.resueltos,
               "nuevos / resueltos vs. corridas anteriores" + (r.no_verificados ? " · " + r.no_verificados + " sin verificar" : ""))
@@ -308,10 +310,35 @@
     });
   }
 
+  var VERIF = { seguro_ya: "seguro ya", firma: "necesita firma", contradicho: "contradicho",
+                no_verificado: "no se pudo verificar" };
+  // Cada estado filtra solo las verificaciones de ESTA corrida (como el total "Ahorro seguro ya"); las de una
+  // corrida anterior tienen su propia opción.
+  function pasaVerif(f, ver) {
+    if (!ver) return true;
+    var v = f.verificacion;
+    if (ver === "sin") return !v;
+    if (ver === "vieja") return !!v && !v.vigente;
+    return !!v && v.vigente && v.estado === ver;
+  }
+  function bloqueVerif(f) {
+    var v = f.verificacion;
+    if (!v) return null;
+    // Una verificación de una corrida anterior se muestra atenuada: el recurso pudo cambiar y no cuenta en el total.
+    return el("div", { class: "verif" + (v.vigente ? "" : " vieja") }, [
+      el("span", { class: "tag v-" + (v.vigente ? v.estado : "vieja"),
+                   text: "skill: " + (VERIF[v.estado] || v.estado) + (v.vigente ? "" : " (corrida anterior)") }),
+      el("span", { text: (v.motivo || "") + (v.vigente ? "" : " · verificado en " + corridaCorta(v.corrida) + ", re-verificar") }),
+      v.pregunta ? el("div", { text: "Pregunta para el dueño: " + v.pregunta }) : null,
+      v.evidencia ? el("div", { class: "detalle", text: "Evidencia: " + v.evidencia }) : null
+    ]);
+  }
+
   function pintarHallazgos() {
     var pres = $("f-presencia").value, est = $("f-estado").value, sev = $("f-sev").value,
-        cat = $("f-cat").value, cta = estado.cuenta, txt = $("f-q").value.toLowerCase();
+        cat = $("f-cat").value, ver = $("f-verif").value, cta = estado.cuenta, txt = $("f-q").value.toLowerCase();
     var lista = estado.hallazgos.filter(function (f) {
+      if (!pasaVerif(f, ver)) return false;
       if (pres === "nuevo" ? !f.nuevo : pres && f.presencia !== pres) return false;
       if (est && f.estado !== est) return false;
       if (sev && f.severity !== sev) return false;
@@ -325,6 +352,7 @@
     estado.hallazgos.forEach(function (f) {
       if (pres === "nuevo" ? !f.nuevo : pres && f.presencia !== pres) return;
       if ((est && f.estado !== est) || (cat && f.category !== cat) || (cta && f.account_id !== cta)) return;
+      if (!pasaVerif(f, ver)) return;
       if (txt && [f.title, f.detail, f.resource_id, f.rule_id].join(" ").toLowerCase().indexOf(txt) < 0) return;
       if (porSev[f.severity] != null) porSev[f.severity]++;
     });
@@ -354,7 +382,8 @@
       cuerpo.appendChild(el("tr", {}, [
         el("td", {}, [el("span", { class: "sev sev-" + sevClase(f.severity), text: f.severity })]),
         el("td", {}, [el("div", { text: f.title }), el("div", { class: "detalle", text: f.detail || "" }),
-                      el("div", { class: "detalle", text: f.category + " · " + f.source + " · " + (f.rule_id || "") })]),
+                      el("div", { class: "detalle", text: f.category + " · " + f.source + " · " + (f.rule_id || "") }),
+                      bloqueVerif(f)]),
         el("td", { text: nombreCuenta(f.account_id) + (f.region ? " · " + f.region : "") }),
         el("td", { class: "detalle", text: f.resource_id || "—" }),
         el("td", { class: "num", text: f.monthly_usd != null ? dinero(f.monthly_usd) + (f.is_saving === false && (f.category === "costo" || f.category === "desperdicio") ? " (no suma)" : "") : "—" }),
@@ -523,6 +552,15 @@
     api("/api/resumen?" + q(base)).then(function (r) { estado.resumen = r; pintarResumen(); }).catch(function () {});
   }
 
+  // El informe de la skill se muestra como texto (textContent): no se interpreta Markdown ni HTML.
+  function cargarInforme() {
+    var pre = $("informe-texto"), mia = generacion;
+    pre.textContent = "Cargando…";
+    api("/api/informe?" + q({ org: estado.org, run: estado.run }))
+      .then(function (r) { if (mia === generacion) pre.textContent = r.texto; })  // otra corrida ya elegida: no pintar
+      .catch(function (e) { if (mia === generacion) pre.textContent = "No se pudo cargar: " + e.message; });
+  }
+
   function fallo(e) { $("sub").textContent = "Error al cargar: " + e.message; }
 
   function cargarRun() {
@@ -534,6 +572,12 @@
       if (mia !== generacion) return;
       estado.resumen = res[0];
       pintarMoneda();
+      $("tab-informe").hidden = !res[0].tiene_informe;
+      $("informe-texto").textContent = "";
+      if (!$("t-informe").hidden) {  // la pestaña Informe estaba abierta: recargar la de esta corrida o salir
+        if (res[0].tiene_informe) cargarInforme();
+        else document.querySelector('nav button[data-tab="resumen"]').click();
+      }
       estado.hallazgos = res[1];
       estado.recursos = res[2];
       estado.pagina = 0;
@@ -607,12 +651,13 @@
       $(id).addEventListener("change", function () { estado.pagina = 0; pintarRecursos(); });
     });
     $("r-q").addEventListener("input", function () { estado.pagina = 0; pintarRecursos(); });
-    ["f-presencia", "f-estado", "f-sev", "f-cat"].forEach(function (id) { $(id).addEventListener("change", pintarHallazgos); });
+    ["f-presencia", "f-estado", "f-sev", "f-cat", "f-verif"].forEach(function (id) { $(id).addEventListener("change", pintarHallazgos); });
     $("f-q").addEventListener("input", pintarHallazgos);
     document.querySelectorAll("nav button").forEach(function (b) {
       b.addEventListener("click", function () {
         document.querySelectorAll("nav button").forEach(function (x) { x.setAttribute("aria-selected", String(x === b)); });
-        ["resumen", "recursos", "hallazgos", "corridas"].forEach(function (t) { $("t-" + t).hidden = t !== b.dataset.tab; });
+        ["resumen", "recursos", "hallazgos", "corridas", "informe"].forEach(function (t) { $("t-" + t).hidden = t !== b.dataset.tab; });
+        if (b.dataset.tab === "informe") cargarInforme();
       });
     });
     var tema = null;

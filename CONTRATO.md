@@ -163,3 +163,42 @@ Campos v2 (aditivos) de cada finding:
 
 - `errors`: corridas de aws-doctor que fallaron, checks de aws-doctor que fallaron (`aws-doctor/<check>`) y categorías de aws-doctor que `doctor.py` no conoce (señal de que hay que actualizar `CATEGORIAS`).
 - Si un recurso tiene un finding de `desperdicio`, sus findings de `costo` se descartan: el ahorro es borrarlo, no optimizarlo. Los totales de `findings.md` y `reporte.html` suman solo `desperdicio` + `costo`.
+
+## verificacion.json (skill metodo-dive, opcional)
+
+Lo que la skill averiguó en la pasada escéptica. Lo escribe en la carpeta de la corrida y lo valida con
+`skill/scripts/verificacion.py`. El dashboard lo lee aunque la corrida ya estuviera ingerida (lo relee si cambia).
+
+```json
+{
+  "run_id": "2026-10-18T194232Z",
+  "generado": "2026-10-18T20:00:00Z",
+  "items": [
+    {"fingerprint": "a1b2c3d4e5f60718", "id": "F031", "estado": "seguro_ya",
+     "motivo": "available, sin tags ni eventos en 90 días", "pregunta_dueno": null,
+     "evidencia": "describe-volumes → available; lookup-events → sin eventos", "created_by": null, "owner": null}
+  ]
+}
+```
+
+- `run_id`: el de `findings.json`. `fingerprint`: el del finding; la verificación sigue al problema entre
+  corridas, no al `id`.
+- `estado`:
+  - `seguro_ya`: reversible y re-verificado. Solo vale en un finding con `is_saving` y monto, de un tipo de
+    problema reversible.
+  - `firma`: verificado, pero necesita la decisión del dueño.
+  - `contradicho`: la verificación lo desmiente.
+  - `no_verificado`: no se pudo verificar.
+- `motivo` (obligatorio, hasta 500 caracteres), `pregunta_dueno` (500), `evidencia` (2000).
+- `created_by` / `owner`: nombres de personas. Van aquí para que el anonimizador los aprenda y los reemplace
+  también en `informe-finops.md`.
+- En el dashboard:
+  - Cada finding muestra la verificación más reciente hasta esa corrida.
+  - Una verificación de una corrida anterior se ve atenuada y con su fecha, y no cuenta en "Ahorro seguro ya": el
+    recurso pudo cambiar.
+  - "Ahorro seguro ya" suma los `seguro_ya` abiertos verificados en esa misma corrida.
+  - Las reglas son las mismas que las del validador (`common/verificacion.py`): un archivo con cualquier problema
+    no se muestra, ni a medias.
+  - `verificacion.json` e `informe-finops.md` no se leen si son symlinks o hardlinks. Tampoco si pesan más de
+    2 MB y 1 MB, respectivamente.
+  - El informe se ve como texto en la pestaña Informe.
