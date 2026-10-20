@@ -67,6 +67,36 @@ def _contexto(f, idx):
             "iac": iac, "nombre": r.get("name")}
 
 
+MAX_FP_GRUPO = 100  # el contrato admite hasta 100 fingerprints por insight
+
+
+def _grupos(findings):
+    """Todos los findings agrupados por regla: lo que la skill necesita para citar fingerprints (y sumar montos)
+    sin leer findings.json. `fp_con_monto` es el subconjunto que sirve en una fuente `suma:` (monto positivo).
+    Si el grupo es `mixto` (unos findings suman como ahorro y otros no, ej. AMIs de AWS Backup), para hablar de ahorro usa
+    `fp_ahorro`: `suma_usd` y `fp_con_monto` incluyen a los que no suman."""
+    por_regla = {}
+    for f in findings:
+        por_regla.setdefault(f.get("rule_id") or "?", []).append(f)
+    grupos = []
+    for rid, lista in por_regla.items():
+        con_monto = [f for f in lista if _usd(f)]
+        ahorro = [f for f in con_monto if f.get("is_saving")]
+        grupos.append({
+            "rule_id": rid, "n": len(lista), "categoria": lista[0].get("category"),
+            "suma_usd": round(sum(_usd(f) for f in con_monto), 2),
+            "suma_como_ahorro": any(f.get("is_saving") for f in lista),
+            "mixto": any(f.get("is_saving") for f in lista) and not all(f.get("is_saving") for f in lista),
+            "fp_ahorro": [f.get("fingerprint") for f in ahorro if f.get("fingerprint")][:MAX_FP_GRUPO],
+            "reversibilidad": reversibilidad(lista[0]),
+            "cuentas": sorted({f.get("account_id") for f in lista if f.get("account_id")}),
+            "fingerprints": [f.get("fingerprint") for f in lista if f.get("fingerprint")][:MAX_FP_GRUPO],
+            "fp_con_monto": [f.get("fingerprint") for f in con_monto if f.get("fingerprint")][:MAX_FP_GRUPO],
+            "truncado": len(lista) > MAX_FP_GRUPO,
+            "ejemplos": [f.get("title") for f in lista[:3]]})
+    return sorted(grupos, key=lambda g: (-g["suma_usd"], -g["n"], g["rule_id"]))
+
+
 def resumir(carpeta, top=15):
     carpeta = Path(carpeta)
     findings_doc = _leer(carpeta / "findings.json")
@@ -125,6 +155,7 @@ def resumir(carpeta, top=15):
         "n_candidatos_total": len(ahorro),
         "gasto_informativo": [item(f) for f in gasto[:top]],
         "solapados": [item(f) for f in solapados[:top]],
+        "grupos": _grupos(findings),
         "diferidos": [item(f) for f in diferidos[:top]],
         "riesgos": {"por_severidad": {s: sum(1 for f in riesgos if f.get("severity") == s) for s in ("alta", "media", "baja")},
                     "altos": [item(f) for f in riesgos if f.get("severity") == "alta"][:top]},

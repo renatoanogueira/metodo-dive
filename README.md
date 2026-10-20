@@ -123,16 +123,23 @@ Abre el navegador solo, en `http://127.0.0.1:8765/#t=<token>` (si el puerto est�
 
 | Pestaña | Qué muestra (todo con filtro por cuenta) |
 |---|---|
-| Resumen | Cuentas, regiones y recursos; factura, uso e impuestos de la ventana y del último mes; factura por concepto y mes a mes; uso mensual por cuenta; servicios y tipos de uso más caros; evolución entre corridas |
+| Resumen | Cuentas, regiones y recursos; factura, uso e impuestos de la ventana y del último mes; factura por concepto y mes a mes; uso mensual por cuenta; servicios y tipos de uso más caros; evolución entre corridas. Con insights: la tarjeta "Ahorro seguro ya", lo primero que concluye la skill y lo que anota aparte (lagunas, avisos sin recurso) |
 | Recursos | Inventario completo con filtros y detalle (tags, atributos, relaciones, hallazgos) |
-| Hallazgos | Contador por severidad; historia entre corridas (nuevo, resuelto, no verificado); estado editable (abierto, aceptado, ignorado, resuelto) que se guarda por fingerprint |
+| Hallazgos | Contador por severidad; historia entre corridas (nuevo, resuelto, no verificado); estado editable (abierto, aceptado, ignorado, resuelto) que se guarda por fingerprint. Cada hallazgo muestra una línea con lo que concluyó la skill y "ver detalle" (texto, qué no se pudo determinar, pregunta al dueño, evidencia y acción) |
 | Corridas | Cada corrida con su tipo, errores y su `reporte.html` |
+| Informe (.md) | `informe-finops.md` como texto, con un aviso si ya no corresponde al `insights.json` actual |
+
+Los filtros de Recursos y Hallazgos y la pestaña abierta se recuerdan al recargar (solo en tu navegador); un aviso dice cuántos filtros hay activos.
 
 #### Uso: skill para Claude Code
 
-`skill/` es una skill que corre `dive.sh` (solo lectura), lee la corrida y escribe `informe-finops.md` en su carpeta. El informe trae:
-- dos totales: "ahorro seguro ya" (reversible y re-verificado en AWS) y "máximo teórico";
-- cada ítem con su evidencia y su confianza, si es reversible y el comando para que lo ejecute una persona.
+`skill/` (`metodo-dive`) es la capa de análisis: DIVE junta los datos y la skill los lee con criterio. El flujo:
+
+1. `dive.sh` (solo lectura) hace la corrida, o se usa la última.
+2. `skill/scripts/resumen.py` resume la corrida: candidatos, grupos por regla con sus fingerprints, diferidos, riesgos, lagunas.
+3. La skill analiza. Si le falta un dato que cambia la decisión (¿ese disco tiene un backup programado? ¿ese balanceador tuvo tráfico en 30 días?), lo pide con `skill/scripts/aws_leer.py`, el único camino a AWS: lista blanca de lecturas de metadatos, siempre con el perfil de solo lectura `dive-<cuenta>`, parámetros JSON validados, sin shell, salida cruda guardada en `aws/` con su hash y con los campos sensibles redactados.
+4. Escribe `insights.json` (ver [CONTRATO.md](CONTRATO.md)): datos estructurados, no texto libre. El dinero y los porcentajes van como `{{c1}}` con la fuente de la cifra (un finding, `discovery.json`, una evidencia); un recurso solo puede estar en insights con estados compatibles; las acciones son comandos `aws` acotados para que los ejecute una persona.
+5. `skill/scripts/insights.py` valida el archivo con las mismas reglas que usa el dashboard, calcula los totales ("ahorro seguro ya" y "máximo teórico") y exporta `informe-finops.md`.
 
 La skill nunca cambia nada en AWS. Para instalarla:
 
@@ -140,7 +147,15 @@ La skill nunca cambia nada en AWS. Para instalarla:
 mkdir -p ~/.claude/skills && ln -s "$PWD/skill" ~/.claude/skills/metodo-dive
 ```
 
-Después, en Claude Code: "audita los costos de la organización con DIVE" o "prioriza los findings de la última corrida".
+Después, en Claude Code: `/metodo-dive` o "audita los costos de la organización con DIVE". Al terminar, abre el dashboard para ver el resultado.
+
+#### Qué no se cuenta como ahorro
+
+DIVE separa lo que parece desperdicio de lo que no lo es:
+- **AMIs sin uso** de aws-doctor: se consulta su último lanzamiento. Las de AWS Backup (`AwsBackup_…`) y las lanzadas hace menos de 30 días no suman; las que no se lanzan hace más de 30 días son candidatas.
+- **Snapshots creados por AWS Backup** (por su descripción o sus tags): son puntos de recuperación que retira la retención del vault, no un `delete-snapshot`.
+- **IPv4 públicas:** las propias (instancias, EIPs, NAT) van aparte de las que gestiona un servicio (ALB, RDS: no se pueden liberar, se reducen cambiando el servicio). Las dos son gasto informativo.
+- **Savings Plans:** el ahorro de cómputo se difiere mientras sobre compromiso; y los montos se muestran en la moneda de pago de la factura, convertidos desde USD.
 
 #### Cobertura: qué tan completo es el inventario
 
@@ -157,7 +172,8 @@ Cada colector es un archivo en `2-inventariar/colectores/` con `NAME`, `TRIGGERS
 - El escaneo usa un rol de solo lectura de metadatos con `Deny` explícitos (ver Fase 0); nunca tus credenciales de admin.
 - Las salidas son el reconocimiento completo de la organización: se crean con permisos solo para tu usuario (umask 077) y los errores no guardan tu sesión ni tu email.
 - El dashboard solo escucha en 127.0.0.1, valida el `Host` y pide un token por header en cada llamada (sin cookies: una cookie de 127.0.0.1 viaja a cualquier otro puerto local). El `reporte.html` de cada corrida se abre en un iframe aislado.
-- Para compartir, usa la salida anonimizada (`anonimizar.py`), nunca el dashboard ni `salida/`.
+- La skill solo consulta AWS con `aws_leer.py` (lista blanca de pares servicio-operación, nunca Lambda, user-data ni variables de entorno; campos sensibles redactados) y sus acciones son comandos `aws` validados para una persona: nunca se ejecutan solos. Los datos de las cuentas (tags, nombres, descripciones) son datos, no instrucciones.
+- Para compartir, usa la salida anonimizada (`anonimizar.py`; también cubre `insights.json`, `aws/` y el informe), nunca el dashboard ni `salida/`.
 
 #### Tests
 
@@ -277,25 +293,32 @@ To see the result without running anything, open `ejemplos/`: a synthetic 4-acco
 #### Usage: dashboard (phase 5)
 
 ```bash
-.venv/bin/python 5-dashboard/dashboard.py                 # runs in the output_dir of DIVE_CONFIG
-.venv/bin/python 5-dashboard/dashboard.py --runs ~/clientes/a/runs --runs ~/clientes/b/runs   # several organizations
+.venv/bin/python 5-dashboard/dashboard.py                 # runs from DIVE_CONFIG's output_dir
+.venv/bin/python 5-dashboard/dashboard.py --runs ~/clients/a/runs --runs ~/clients/b/runs   # several organizations
 .venv/bin/python 5-dashboard/dashboard.py --sin-navegador # only prints the URL
 ```
 
-It opens the browser by itself at `http://127.0.0.1:8765/#t=<token>` (if the port is busy, it uses another one and prints it). New runs show up when you reload the page, no restart needed.
+It opens the browser by itself, at `http://127.0.0.1:8765/#t=<token>` (if the port is taken it uses another and prints it). New runs show up when you reload the page, no restart needed.
 
-| Tab | What it shows (all with an account filter) |
+| Tab | What it shows (everything filterable by account) |
 |---|---|
-| Resumen | Accounts, regions and resources; bill, usage and taxes for the window and the last month; bill by item and month by month; monthly usage per account; most expensive services and usage types; evolution between runs |
-| Recursos | Full inventory with filters and detail (tags, attributes, relations, findings) |
-| Hallazgos | Count by severity; history between runs (new, resolved, not verified); editable state (open, accepted, ignored, resolved) saved per fingerprint |
-| Corridas | Each run with its type, errors and its `reporte.html` |
+| Summary | Accounts, regions and resources; bill, usage and taxes for the window and the last month; bill by line item and month by month; monthly usage per account; most expensive services and usage types; evolution across runs. With insights: the "Safe saving now" card, what the skill concludes first and what it notes aside (gaps, notices without a resource) |
+| Resources | Full inventory with filters and detail (tags, attributes, relations, findings) |
+| Findings | Counter by severity; history across runs (new, resolved, unverified); editable status (open, accepted, ignored, resolved) stored by fingerprint. Each finding shows one line with the skill's conclusion and "ver detalle" (text, what could not be determined, owner question, evidence and action) |
+| Runs | Each run with its type, errors and its `reporte.html` |
+| Report (.md) | `informe-finops.md` as text, with a notice if it no longer matches the current `insights.json` |
+
+The Resources and Findings filters and the open tab are remembered on reload (in your browser only); a notice says how many filters are active.
 
 #### Usage: Claude Code skill
 
-`skill/` is a skill that runs `dive.sh` (read-only), reads the run and writes `informe-finops.md` in its folder. The report has:
-- two totals: "save now safely" (reversible and re-verified in AWS) and "maximum theoretical";
-- each item with its evidence and confidence, whether it's reversible, and the command for a person to run.
+`skill/` (`metodo-dive`) is the analysis layer: DIVE gathers the data and the skill reads it with judgement. The flow:
+
+1. `dive.sh` (read-only) makes the run, or the latest one is used.
+2. `skill/scripts/resumen.py` summarizes the run: candidates, groups by rule with their fingerprints, deferred savings, risks, gaps.
+3. The skill analyzes. If it lacks a piece of data that changes the decision (does that disk have a scheduled backup? did that load balancer get traffic in 30 days?), it asks for it through `skill/scripts/aws_leer.py`, the only path to AWS: an allowlist of metadata reads, always with the read-only `dive-<account>` profile, validated JSON parameters, no shell, raw output saved in `aws/` with its hash and sensitive fields redacted.
+4. It writes `insights.json` (see [CONTRATO.md](CONTRATO.md)): structured data, not free text. Money and percentages go as `{{c1}}` with the figure's source (a finding, `discovery.json`, an evidence item); a resource can only appear in insights with compatible states; actions are bounded `aws` commands for a person to run.
+5. `skill/scripts/insights.py` validates the file with the same rules the dashboard uses, computes the totals ("safe saving now" and "theoretical maximum") and exports `informe-finops.md`.
 
 The skill never changes anything in AWS. To install it:
 
@@ -303,7 +326,15 @@ The skill never changes anything in AWS. To install it:
 mkdir -p ~/.claude/skills && ln -s "$PWD/skill" ~/.claude/skills/metodo-dive
 ```
 
-Then, in Claude Code: "audit the organization's costs with DIVE" or "prioritize the findings of the last run".
+Then, in Claude Code: `/metodo-dive` or "audit the organization's costs with DIVE". When it finishes, open the dashboard to see the result.
+
+#### What is not counted as a saving
+
+DIVE separates what looks like waste from what is not:
+- **Unused AMIs** from aws-doctor: their last launch is checked. AWS Backup ones (`AwsBackup_…`) and those launched less than 30 days ago do not add up; those not launched for more than 30 days are candidates.
+- **Snapshots created by AWS Backup** (by description or tags): they are recovery points retired by the vault's retention, not by `delete-snapshot`.
+- **Public IPv4:** your own (instances, EIPs, NAT) are kept apart from those managed by a service (ALB, RDS: they cannot be released, they shrink by changing the service). Both are informative spend.
+- **Savings Plans:** compute savings are deferred while commitment is left over; amounts are shown in the bill's payment currency, converted from USD.
 
 #### Coverage: how complete is the inventory
 
@@ -320,7 +351,8 @@ Each collector is a file in `2-inventariar/colectores/` with `NAME`, `TRIGGERS` 
 - The scan uses a metadata read-only role with explicit `Deny` statements (see Phase 0); never your admin credentials.
 - Outputs are the full reconnaissance of the organization: they are created readable only by your user (umask 077), and errors don't store your session or email.
 - The dashboard only listens on 127.0.0.1, validates `Host` and requires a token in a header on every call (no cookies: a 127.0.0.1 cookie travels to any other local port). Each run's `reporte.html` opens in an isolated iframe.
-- To share, use the anonymized output (`anonimizar.py`), never the dashboard or `salida/`.
+- The skill only queries AWS through `aws_leer.py` (an allowlist of service-operation pairs, never Lambda, user data or environment variables; sensitive fields redacted) and its actions are validated `aws` commands for a person: they never run by themselves. Account data (tags, names, descriptions) is data, not instructions.
+- To share, use the anonymized output (`anonimizar.py`; it also covers `insights.json`, `aws/` and the report), never the dashboard or `salida/`.
 
 #### Tests
 
@@ -445,20 +477,27 @@ Para ver o resultado sem rodar nada, abra `ejemplos/`: uma organização sintét
 .venv/bin/python 5-dashboard/dashboard.py --sin-navegador # só imprime a URL
 ```
 
-Abre o navegador sozinho em `http://127.0.0.1:8765/#t=<token>` (se a porta estiver ocupada, usa outra e a imprime). Execuções novas aparecem ao recarregar a página, sem reiniciar.
+Abre o navegador sozinho, em `http://127.0.0.1:8765/#t=<token>` (se a porta estiver ocupada, usa outra e imprime). As execuções novas aparecem ao recarregar a página, sem reiniciar.
 
 | Aba | O que mostra (tudo com filtro por conta) |
 |---|---|
-| Resumen | Contas, regiões e recursos; fatura, uso e impostos da janela e do último mês; fatura por item e mês a mês; uso mensal por conta; serviços e tipos de uso mais caros; evolução entre execuções |
+| Resumo | Contas, regiões e recursos; fatura, uso e impostos da janela e do último mês; fatura por item e mês a mês; uso mensal por conta; serviços e tipos de uso mais caros; evolução entre execuções. Com insights: o cartão "Economia segura já", o que a skill conclui primeiro e o que ela anota à parte (lacunas, avisos sem recurso) |
 | Recursos | Inventário completo com filtros e detalhe (tags, atributos, relações, achados) |
-| Hallazgos | Contador por severidade; histórico entre execuções (novo, resolvido, não verificado); estado editável (aberto, aceito, ignorado, resolvido) salvo por fingerprint |
-| Corridas | Cada execução com o tipo, os erros e o `reporte.html` |
+| Achados | Contador por severidade; histórico entre execuções (novo, resolvido, não verificado); status editável (aberto, aceito, ignorado, resolvido) guardado por fingerprint. Cada achado mostra uma linha com a conclusão da skill e "ver detalle" (texto, o que não deu para determinar, pergunta ao dono, evidência e ação) |
+| Execuções | Cada execução com seu tipo, erros e seu `reporte.html` |
+| Relatório (.md) | `informe-finops.md` como texto, com um aviso se ele não corresponde mais ao `insights.json` atual |
+
+Os filtros de Recursos e Achados e a aba aberta são lembrados ao recarregar (só no seu navegador); um aviso diz quantos filtros estão ativos.
 
 #### Uso: skill para o Claude Code
 
-`skill/` é uma skill que roda o `dive.sh` (só leitura), lê a execução e escreve `informe-finops.md` na pasta dela. O relatório traz:
-- dois totais: "economia segura já" (reversível e re-verificada na AWS) e "máximo teórico";
-- cada item com a sua evidência e confiança, se é reversível e o comando para uma pessoa executar.
+`skill/` (`metodo-dive`) é a camada de análise: o DIVE junta os dados e a skill os lê com critério. O fluxo:
+
+1. `dive.sh` (só leitura) faz a execução, ou usa-se a última.
+2. `skill/scripts/resumen.py` resume a execução: candidatos, grupos por regra com seus fingerprints, diferidos, riscos, lacunas.
+3. A skill analisa. Se falta um dado que muda a decisão (aquele disco tem backup agendado? aquele balanceador teve tráfego em 30 dias?), ela o pede com `skill/scripts/aws_leer.py`, o único caminho até a AWS: lista de leituras de metadados permitidas, sempre com o perfil de leitura `dive-<conta>`, parâmetros JSON validados, sem shell, saída crua guardada em `aws/` com seu hash e com os campos sensíveis redigidos.
+4. Escreve `insights.json` (ver [CONTRATO.md](CONTRATO.md)): dados estruturados, não texto livre. Dinheiro e percentuais vão como `{{c1}}` com a fonte do número (um achado, `discovery.json`, uma evidência); um recurso só pode estar em insights com estados compatíveis; as ações são comandos `aws` restritos para uma pessoa executar.
+5. `skill/scripts/insights.py` valida o arquivo com as mesmas regras do dashboard, calcula os totais ("economia segura já" e "máximo teórico") e exporta `informe-finops.md`.
 
 A skill nunca altera nada na AWS. Para instalar:
 
@@ -466,7 +505,15 @@ A skill nunca altera nada na AWS. Para instalar:
 mkdir -p ~/.claude/skills && ln -s "$PWD/skill" ~/.claude/skills/metodo-dive
 ```
 
-Depois, no Claude Code: "audita os custos da organização com o DIVE" ou "prioriza os findings da última execução".
+Depois, no Claude Code: `/metodo-dive` ou "audite os custos da organização com o DIVE". Ao terminar, abra o dashboard para ver o resultado.
+
+#### O que não conta como economia
+
+O DIVE separa o que parece desperdício do que não é:
+- **AMIs sem uso** do aws-doctor: consulta-se o último lançamento. As do AWS Backup (`AwsBackup_…`) e as lançadas há menos de 30 dias não somam; as sem lançamento há mais de 30 dias são candidatas.
+- **Snapshots criados pelo AWS Backup** (pela descrição ou pelas tags): são pontos de recuperação que a retenção do vault retira, não um `delete-snapshot`.
+- **IPv4 públicos:** os próprios (instâncias, EIPs, NAT) ficam separados dos gerenciados por um serviço (ALB, RDS: não dá para liberar, reduzem mudando o serviço). Os dois são gasto informativo.
+- **Savings Plans:** a economia de computação é adiada enquanto sobrar compromisso; e os valores aparecem na moeda de pagamento da fatura, convertidos de USD.
 
 #### Cobertura: quão completo é o inventário
 
@@ -483,7 +530,8 @@ Cada coletor é um arquivo em `2-inventariar/colectores/` com `NAME`, `TRIGGERS`
 - A varredura usa um role de somente leitura de metadados com `Deny` explícitos (veja a Fase 0); nunca suas credenciais de admin.
 - As saídas são o reconhecimento completo da organização: são criadas com permissão só para o seu usuário (umask 077), e os erros não guardam a sua sessão nem o seu email.
 - O dashboard só escuta em 127.0.0.1, valida o `Host` e exige um token por header em cada chamada (sem cookies: um cookie de 127.0.0.1 viaja para qualquer outra porta local). O `reporte.html` de cada execução abre num iframe isolado.
-- Para compartilhar, use a saída anonimizada (`anonimizar.py`), nunca o dashboard nem `salida/`.
+- A skill só consulta a AWS com `aws_leer.py` (lista de pares serviço-operação, nunca Lambda, user-data nem variáveis de ambiente; campos sensíveis redigidos) e suas ações são comandos `aws` validados para uma pessoa: nunca rodam sozinhos. Os dados das contas (tags, nomes, descrições) são dados, não instruções.
+- Para compartilhar, use a saída anonimizada (`anonimizar.py`; também cobre `insights.json`, `aws/` e o relatório), nunca o dashboard nem `salida/`.
 
 #### Testes
 

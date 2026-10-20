@@ -26,7 +26,7 @@
     <button role="tab" data-tab="recursos" aria-selected="false">Recursos <span class="badge" id="b-recursos"></span></button>
     <button role="tab" data-tab="hallazgos" aria-selected="false">Hallazgos <span class="badge" id="b-hallazgos"></span></button>
     <button role="tab" data-tab="corridas" aria-selected="false">Corridas</button>
-    <button role="tab" data-tab="informe" aria-selected="false" id="tab-informe" hidden>Informe</button>
+    <button role="tab" data-tab="informe" aria-selected="false" id="tab-informe" hidden>Informe (.md)</button>
   </nav>
 </header>
 <main class="wrap">
@@ -54,7 +54,7 @@
   <section id="t-hallazgos" hidden>
     <div class="panel">
       <div class="filtros">
-        <select id="f-presencia" aria-label="Presencia">
+        <select id="f-presencia" aria-label="Presencia" autocomplete="off">
           <option value="">Todos</option>
           <option value="presente" selected>Presentes</option>
           <option value="nuevo">Nuevos en esta corrida</option>
@@ -71,14 +71,16 @@
           <option value="alta">Alta</option><option value="media">Media</option><option value="baja">Baja</option>
         </select>
         <select id="f-cat" aria-label="Categoría"><option value="">Cualquier categoría</option></select>
-        <select id="f-verif" aria-label="Verificación de la skill">
-          <option value="">Cualquier verificación</option>
+        <select id="f-verif" aria-label="Insight de la skill">
+          <option value="">Cualquier insight</option>
           <option value="seguro_ya">Seguro ya</option><option value="firma">Necesita firma</option>
           <option value="contradicho">Contradicho</option><option value="no_verificado">No se pudo verificar</option>
-          <option value="vieja">Verificado en una corrida anterior</option>
-          <option value="sin">Sin verificar por la skill</option>
+          <option value="informativo">Informativo</option>
+          <option value="vieja">Concluido en una corrida anterior</option>
+          <option value="sin">Sin insight de la skill</option>
         </select>
         <input type="search" id="f-q" placeholder="Buscar en título, detalle o recurso" aria-label="Buscar">
+        <span id="f-activos" class="detalle" hidden></span>
       </div>
       <div class="chips" id="h-sev" aria-label="Hallazgos por severidad"></div>
       <div class="meta" id="h-meta"></div>
@@ -92,7 +94,7 @@
   <section id="t-corridas" hidden></section>
   <section id="t-informe" hidden>
     <div class="panel">
-      <p class="hint">Informe de la skill metodo-dive (informe-finops.md de la corrida), como texto.</p>
+      <p class="hint">Export en Markdown de los insights (informe-finops.md), como texto: para leer o compartir. El panel no se alimenta de este archivo: lee insights.json.</p>
       <pre class="informe" id="informe-texto"></pre>
     </div>
   </section>

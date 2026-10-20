@@ -191,9 +191,12 @@ def crear_handler(db, carpetas, token, puerto):
                     return self._json(datos) if datos else self._error(HTTPStatus.NOT_FOUND, "Corrida desconocida")
                 if ruta == "/api/hallazgos":
                     return self._json(base.hallazgos(con, org, run))
+                if ruta == "/api/insights":
+                    datos = base.insights(con, org, run, cuenta) if RE_RUN_ID.fullmatch(run) else None
+                    return self._json(datos) if datos else self._error(HTTPStatus.NOT_FOUND, "Corrida desconocida")
                 if ruta == "/api/informe":
                     texto = base.informe(con, org, run) if RE_RUN_ID.fullmatch(run) else None
-                    return self._json({"texto": texto}) if texto is not None else \
+                    return self._json({"texto": texto, "actual": base.informe_actual(con, run, texto)}) if texto is not None else \
                         self._error(HTTPStatus.NOT_FOUND, "Esa corrida no tiene informe-finops.md")
                 return self._error(HTTPStatus.NOT_FOUND, "No existe")
             finally:

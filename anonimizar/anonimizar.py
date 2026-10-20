@@ -692,7 +692,8 @@ class Anonimizador:
             t = self.re_terminos.sub(lambda m: con_caja(m.group(0), self.terminos[m.group(0).lower()]), t)
         return t
 
-    CATS_FINAL = ("token", "cdk", "uuid", "access_key", "resource_id")  # la última gana si se repite
+    # La última gana si se repite. fingerprint va al final: los insights los citan dentro de texto ("finding:<fp>...").
+    CATS_FINAL = ("token", "cdk", "uuid", "access_key", "resource_id", "fingerprint")
 
     def congelar(self):
         """Compila todo lo aprendido en la primera pasada. La pasada final reemplaza cualquier valor
@@ -778,10 +779,15 @@ class Anonimizador:
                 k2 = self.texto(k, costos=False) if isinstance(k, str) else k
                 if isinstance(k, str) and isinstance(v, str) and RE_CLAVE_PERSONA.match(k):
                     salida[k2] = self.persona(v)
+                elif isinstance(k, str) and RE_CLAVE_PERSONA.match(k) and isinstance(v, list) \
+                        and all(isinstance(x, str) for x in v):
+                    salida[k2] = [self.persona(x) for x in v]  # lista de nombres (ej. usuarios de una salida de AWS)
                 elif k == "run_id" and isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}(T\d{6}Z)?", v):
                     salida[k2] = v
                 elif k == "fingerprint" and isinstance(v, str):
                     salida[k2] = self.huella(v)
+                elif k == "fingerprints" and isinstance(v, list) and all(isinstance(x, str) for x in v):
+                    salida[k2] = [self.huella(x) for x in v]  # insights.json: alcance.fingerprints
                 elif k == "org_alias" and isinstance(v, str):
                     salida[k2] = self.org_alias(v)
                 elif (k == "name" and len(ruta) >= 2 and ruta[-2] == "accounts" and isinstance(v, str)) \
@@ -1186,6 +1192,9 @@ def main(argv=None):
             if ruta.suffix.lower() == ".json":
                 try:
                     datos = an.json(json.loads(contenido))
+                    # Salida del runner (aws/A###.json): el hash cubre la salida ya anonimizada, o la copia no validaría.
+                    if isinstance(datos, dict) and isinstance(datos.get("salida"), str) and "sha256" in datos:
+                        datos["sha256"] = hashlib.sha256(datos["salida"].encode()).hexdigest()
                     if costos != "exact" and isinstance(datos, dict):
                         datos["anonymized"] = {"costs": costos}
                     resultado = json.dumps(datos, indent=2, ensure_ascii=False) + "\n"

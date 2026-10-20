@@ -261,6 +261,23 @@
       tarjeta("Cambios", "+" + r.nuevos + " / −" + r.resueltos,
               "nuevos / resueltos vs. corridas anteriores" + (r.no_verificados ? " · " + r.no_verificados + " sin verificar" : ""))
     ]));
+    var prob = (r.insights && r.insights.problemas) || [];
+    if (prob.length) {
+      cont.appendChild(el("div", { class: "aviso-insights" }, [
+        el("b", { text: "insights.json no es válido y no se muestra:" }),
+        el("ul", {}, prob.slice(0, 10).map(function (p) { return el("li", { text: p }); }))]));
+    }
+    if (r.prioridades && r.prioridades.length) {
+      cont.appendChild(el("h2", { class: "grupo", text: "Lo primero que concluye la skill" }));
+      r.prioridades.forEach(function (ins) { cont.appendChild(tarjetaInsightCorta(ins)); });
+      var ver = el("button", { type: "button", class: "btn", text: "Ver los hallazgos con su insight" });
+      ver.addEventListener("click", function () { document.querySelector('nav button[data-tab="hallazgos"]').click(); });
+      cont.appendChild(ver);
+    }
+    if (r.aparte && r.aparte.length) {
+      cont.appendChild(el("h2", { class: "grupo", text: "Lo que la skill anota aparte (" + r.aparte.length + ")" }));
+      r.aparte.forEach(function (ins) { cont.appendChild(tarjetaInsight(ins)); });
+    }
     if (r.tiene_cargos) {
       cont.appendChild(el("div", { class: "grid2" }, [
         el("div", {}, [el("h2", { text: "Factura del mes por concepto" }), tablaFactura(r)]),
@@ -299,42 +316,166 @@
         el("th", { class: "num", text: "Hallazgos" }), el("th", { class: "num", text: "Ahorro estimado/mes" })])]), cuerpo])]));
   }
 
+  // Filtros de Recursos y Hallazgos y pestaña activa: sobreviven a un refresh (solo en este navegador).
+  var IDS_FILTROS = ["f-presencia", "f-estado", "f-sev", "f-cat", "f-verif", "f-q", "r-reg", "r-svc", "r-tipo", "r-hall", "r-q"];
+  var pendientes = {};
+  // Hay filtros guardados de otra sesión: se avisa cuántos están activos (el de presencia empieza en "presente").
+  var DEFECTO = { "f-presencia": "presente" };
+  function pintarFiltrosActivos() {
+    var caja = $("f-activos"), n = 0;
+    ["f-presencia", "f-estado", "f-sev", "f-cat", "f-verif", "f-q"].forEach(function (id) {
+      if ($(id).value !== (DEFECTO[id] || "")) n++;
+    });
+    caja.textContent = "";
+    caja.hidden = !n;
+    if (!n) return;
+    var limpiar = el("button", { type: "button", class: "enlace", text: "limpiar" });
+    limpiar.addEventListener("click", function () {
+      ["f-presencia", "f-estado", "f-sev", "f-cat", "f-verif", "f-q"].forEach(function (id) { $(id).value = DEFECTO[id] || ""; });
+      guardarFiltros(); pintarHallazgos();
+    });
+    caja.appendChild(document.createTextNode(n + " filtro(s) activo(s) · "));
+    caja.appendChild(limpiar);
+  }
+
+  function guardarFiltros() {
+    var d = {};
+    IDS_FILTROS.forEach(function (id) { d[id] = $(id).value; });
+    try { localStorage.setItem("dive-filtros", JSON.stringify(d)); } catch (e) { /* sin storage */ }
+  }
+  function restaurarFiltros() {
+    var d = {};
+    try { d = JSON.parse(localStorage.getItem("dive-filtros") || "{}") || {}; } catch (e) { /* sin storage o corrupto */ }
+    IDS_FILTROS.forEach(function (id) {
+      var v = d[id];
+      if (typeof v !== "string") return;
+      var c = $(id);
+      if (c.tagName === "INPUT") { c.value = v; return; }
+      c.value = v;                                   // opciones fijas: se aplica si existe
+      if (c.value !== v) pendientes[id] = v;         // opciones dinámicas: se aplica cuando se llenen
+    });
+  }
+  // Valor a conservar al rellenar un select dinámico: el actual o, la primera vez, el guardado.
+  function valorActual(s) {
+    var v = s.value || pendientes[s.id] || "";
+    delete pendientes[s.id];
+    return v;
+  }
+
   function filtrosHallazgos() {
     var cats = {};
     estado.hallazgos.forEach(function (f) { if (f.category) cats[f.category] = 1; });
     [["f-cat", Object.keys(cats).sort(), function (c) { return c; }]].forEach(function (d) {
-      var s = $(d[0]), actual = s.value;
+      var s = $(d[0]), actual = valorActual(s);
       while (s.options.length > 1) s.remove(1);
       d[1].forEach(function (v) { s.appendChild(el("option", { value: v, text: d[2](v) })); });
       s.value = d[1].indexOf(actual) >= 0 ? actual : "";
     });
   }
 
-  var VERIF = { seguro_ya: "seguro ya", firma: "necesita firma", contradicho: "contradicho",
-                no_verificado: "no se pudo verificar" };
-  // Cada estado filtra solo las verificaciones de ESTA corrida (como el total "Ahorro seguro ya"); las de una
-  // corrida anterior tienen su propia opción.
+  var ESTADOS_INSIGHT = { seguro_ya: "seguro ya", firma: "necesita firma", contradicho: "contradicho",
+                          no_verificado: "no se pudo verificar", informativo: "informativo" };
+  var TIPOS_INSIGHT = { hallazgo: "hallazgo", causa_costo: "causa de costo", recomendacion: "recomendación",
+                        pregunta: "pregunta", laguna: "lo que no se pudo ver" };
+
+  // El texto de un insight trae {{c1}}: el dinero y los porcentajes llegan como números con su formato y se
+  // pintan aquí (el dinero con dinero(): sigue el selector de moneda). Nada del texto se interpreta como HTML.
+  function textoInsight(t, ins) {
+    return String(t || "").replace(/\{\{(c\d{1,3})\}\}/g, function (m, c) {
+      var d = (ins.cifras || {})[c], v = (ins.valores || {})[c];
+      if (!d || v == null) return m;
+      return d.formato === "usd" ? dinero(v) : d.formato === "pct" ? Number(v).toFixed(1) + "%" : String(Number(v));
+    });
+  }
+
+  // Cada estado filtra solo los insights de ESTA corrida (como el total "Ahorro seguro ya"); los de una corrida
+  // anterior tienen su propia opción.
   function pasaVerif(f, ver) {
     if (!ver) return true;
-    var v = f.verificacion;
+    var v = f.insight;
     if (ver === "sin") return !v;
     if (ver === "vieja") return !!v && !v.vigente;
     return !!v && v.vigente && v.estado === ver;
   }
-  function bloqueVerif(f) {
-    var v = f.verificacion;
+
+  function evidenciaInsight(ins) {
+    return (ins.evidencia || []).map(function (e) {
+      var vals = e.valores ? " · " + Object.keys(e.valores).map(function (k) { return k + " = " + e.valores[k]; }).join(", ") : "";
+      return el("div", { class: "detalle" }, [
+        el("span", { text: "[" + e.id + "] " + (e.origen === "aws" ? "consulta a AWS: " : "datos de DIVE: ") + e.descripcion + vals }),
+        e.comando ? el("div", {}, [el("code", { text: e.comando })]) : null
+      ]);
+    });
+  }
+
+  // Detalle completo de un insight: texto, lo que no se pudo determinar, la pregunta al dueño, la evidencia y la acción.
+  function detalleInsight(ins, sinAviso) {
+    var fps = (ins.alcance || {}).fingerprints || [];
+    var aviso = null;
+    if (!sinAviso && fps.length > 1) {
+      var cuentas = {};
+      estado.hallazgos.forEach(function (f) { if (fps.indexOf(f.fingerprint) >= 0) cuentas[f.account_id] = 1; });
+      var n = Object.keys(cuentas).length;
+      aviso = el("div", { class: "detalle", text: "Abarca " + fps.length + " recursos" + (n > 1 ? " de " + n + " cuentas" : "") +
+        ": el monto del texto es el del conjunto, no el de esta fila." });
+    }
+    return el("div", { class: "insight-detalle" }, [
+      el("p", { text: textoInsight(ins.texto, ins) }), aviso,
+      ins.no_determinado ? el("div", { class: "indeterminado", text: "No determinado: " + ins.no_determinado }) : null,
+      ins.pregunta_dueno ? el("div", { class: "pregunta", text: "Pregunta para el dueño: " + ins.pregunta_dueno }) : null
+    ].concat(evidenciaInsight(ins)).concat([
+      ins.accion ? el("div", { class: "accion" }, [
+        el("div", { class: "detalle", text: "Acción (la ejecuta una persona)" + (ins.accion.reversibilidad ? " · " + ins.accion.reversibilidad : "") }),
+        el("pre", { text: ins.accion.comando })]) : null
+    ]));
+  }
+
+  // Dentro de cada hallazgo: una línea con el estado y el título del insight, y "ver detalle" que despliega el resto.
+  // Uno de una corrida anterior se muestra atenuado: el recurso pudo cambiar y no cuenta en el total.
+  function bloqueInsight(f) {
+    var v = f.insight;
     if (!v) return null;
-    // Una verificación de una corrida anterior se muestra atenuada: el recurso pudo cambiar y no cuenta en el total.
-    return el("div", { class: "verif" + (v.vigente ? "" : " vieja") }, [
+    var cuerpo = null;
+    var ver = el("button", { type: "button", class: "enlace", text: "ver detalle", "aria-expanded": "false" });
+    var caja = el("div", { class: "verif" + (v.vigente ? "" : " vieja") }, [
       el("span", { class: "tag v-" + (v.vigente ? v.estado : "vieja"),
-                   text: "skill: " + (VERIF[v.estado] || v.estado) + (v.vigente ? "" : " (corrida anterior)") }),
-      el("span", { text: (v.motivo || "") + (v.vigente ? "" : " · verificado en " + corridaCorta(v.corrida) + ", re-verificar") }),
-      v.pregunta ? el("div", { text: "Pregunta para el dueño: " + v.pregunta }) : null,
-      v.evidencia ? el("div", { class: "detalle", text: "Evidencia: " + v.evidencia }) : null
+                   text: "skill: " + (ESTADOS_INSIGHT[v.estado] || v.estado) + (v.vigente ? "" : " (corrida anterior)") }),
+      el("span", { text: " " + textoInsight(v.titulo, v) + (v.vigente ? "" : " · de " + corridaCorta(v.corrida) + ", re-analizar") +
+        (((v.alcance || {}).fingerprints || []).length > 1 ? " (conjunto de " + v.alcance.fingerprints.length + ")" : "") + " · " }),
+      ver
+    ]);
+    ver.addEventListener("click", function () {
+      if (cuerpo) { cuerpo.remove(); cuerpo = null; ver.textContent = "ver detalle"; ver.setAttribute("aria-expanded", "false"); return; }
+      cuerpo = detalleInsight(v);
+      caja.appendChild(cuerpo);
+      ver.textContent = "ocultar detalle"; ver.setAttribute("aria-expanded", "true");
+    });
+    return caja;
+  }
+
+  // Tarjeta de la pestaña Resumen: estado, título y detalle completo (para lo que no cuelga de ningún hallazgo).
+  function tarjetaInsight(ins) {
+    return el("div", { class: "insight est-" + ins.estado }, [
+      el("div", { class: "cab" }, [
+        el("span", { class: "tag v-" + ins.estado, text: ESTADOS_INSIGHT[ins.estado] || ins.estado }),
+        el("b", { text: textoInsight(ins.titulo, ins) })]),
+      detalleInsight(ins, true)
+    ]);
+  }
+
+  // Versión corta para "Lo primero que concluye la skill": estado, título y texto.
+  function tarjetaInsightCorta(ins) {
+    return el("div", { class: "insight est-" + ins.estado }, [
+      el("div", { class: "cab" }, [
+        el("span", { class: "tag v-" + ins.estado, text: ESTADOS_INSIGHT[ins.estado] || ins.estado }),
+        el("b", { text: textoInsight(ins.titulo, ins) })]),
+      el("p", { text: textoInsight(ins.texto, ins) }),
+      ins.pregunta_dueno ? el("div", { class: "pregunta", text: "Pregunta para el dueño: " + ins.pregunta_dueno }) : null
     ]);
   }
 
   function pintarHallazgos() {
+    pintarFiltrosActivos();
     var pres = $("f-presencia").value, est = $("f-estado").value, sev = $("f-sev").value,
         cat = $("f-cat").value, ver = $("f-verif").value, cta = estado.cuenta, txt = $("f-q").value.toLowerCase();
     var lista = estado.hallazgos.filter(function (f) {
@@ -383,7 +524,7 @@
         el("td", {}, [el("span", { class: "sev sev-" + sevClase(f.severity), text: f.severity })]),
         el("td", {}, [el("div", { text: f.title }), el("div", { class: "detalle", text: f.detail || "" }),
                       el("div", { class: "detalle", text: f.category + " · " + f.source + " · " + (f.rule_id || "") }),
-                      bloqueVerif(f)]),
+                      bloqueInsight(f)]),
         el("td", { text: nombreCuenta(f.account_id) + (f.region ? " · " + f.region : "") }),
         el("td", { class: "detalle", text: f.resource_id || "—" }),
         el("td", { class: "num", text: f.monthly_usd != null ? dinero(f.monthly_usd) + (f.is_saving === false && (f.category === "costo" || f.category === "desperdicio") ? " (no suma)" : "") : "—" }),
@@ -420,7 +561,7 @@
   }
 
   function opciones(id, valores, etiqueta) {
-    var s = $(id), actual = s.value;
+    var s = $(id), actual = valorActual(s);
     while (s.options.length > 1) s.remove(1);
     valores.forEach(function (v) { s.appendChild(el("option", { value: v, text: etiqueta ? etiqueta(v) : v })); });
     s.value = valores.indexOf(actual) >= 0 ? actual : "";
@@ -557,7 +698,11 @@
     var pre = $("informe-texto"), mia = generacion;
     pre.textContent = "Cargando…";
     api("/api/informe?" + q({ org: estado.org, run: estado.run }))
-      .then(function (r) { if (mia === generacion) pre.textContent = r.texto; })  // otra corrida ya elegida: no pintar
+      .then(function (r) {
+        if (mia !== generacion) return;  // otra corrida ya elegida: no pintar
+        pre.textContent = (r.actual ? "" : "AVISO: este informe no corresponde al insights.json actual (se editó después o no trae su marca). " +
+                           "Vuelve a correr skill/scripts/insights.py.\n\n") + r.texto;
+      })
       .catch(function (e) { if (mia === generacion) pre.textContent = "No se pudo cargar: " + e.message; });
   }
 
@@ -574,9 +719,9 @@
       pintarMoneda();
       $("tab-informe").hidden = !res[0].tiene_informe;
       $("informe-texto").textContent = "";
-      if (!$("t-informe").hidden) {  // la pestaña Informe estaba abierta: recargar la de esta corrida o salir
-        if (res[0].tiene_informe) cargarInforme();
-        else document.querySelector('nav button[data-tab="resumen"]').click();
+      // La pestaña abierta era el Informe: recargar el de esta corrida, o volver a Resumen si ya no hay.
+      if (!$("t-informe").hidden) {
+        if (res[0].tiene_informe) cargarInforme(); else document.querySelector('nav button[data-tab="resumen"]').click();
       }
       estado.hallazgos = res[1];
       estado.recursos = res[2];
@@ -648,18 +793,26 @@
       pintarMoneda(); pintarResumen(); pintarRecursos(); pintarHallazgos(); pintarCorridas();
     });
     ["r-reg", "r-svc", "r-tipo", "r-hall"].forEach(function (id) {
-      $(id).addEventListener("change", function () { estado.pagina = 0; pintarRecursos(); });
+      $(id).addEventListener("change", function () { estado.pagina = 0; guardarFiltros(); pintarRecursos(); });
     });
-    $("r-q").addEventListener("input", function () { estado.pagina = 0; pintarRecursos(); });
-    ["f-presencia", "f-estado", "f-sev", "f-cat", "f-verif"].forEach(function (id) { $(id).addEventListener("change", pintarHallazgos); });
-    $("f-q").addEventListener("input", pintarHallazgos);
+    $("r-q").addEventListener("input", function () { estado.pagina = 0; guardarFiltros(); pintarRecursos(); });
+    ["f-presencia", "f-estado", "f-sev", "f-cat", "f-verif"].forEach(function (id) {
+      $(id).addEventListener("change", function () { guardarFiltros(); pintarHallazgos(); });
+    });
+    $("f-q").addEventListener("input", function () { guardarFiltros(); pintarHallazgos(); });
     document.querySelectorAll("nav button").forEach(function (b) {
       b.addEventListener("click", function () {
         document.querySelectorAll("nav button").forEach(function (x) { x.setAttribute("aria-selected", String(x === b)); });
         ["resumen", "recursos", "hallazgos", "corridas", "informe"].forEach(function (t) { $("t-" + t).hidden = t !== b.dataset.tab; });
+        try { sessionStorage.setItem("dive-pestana", b.dataset.tab); } catch (e) { /* sin storage */ }
         if (b.dataset.tab === "informe") cargarInforme();
       });
     });
+    restaurarFiltros();
+    try {
+      var pest = sessionStorage.getItem("dive-pestana");
+      if (pest && ["resumen", "recursos", "hallazgos", "corridas"].indexOf(pest) >= 0) document.querySelector('nav button[data-tab="' + pest + '"]').click();
+    } catch (e) { /* sin storage */ }
     var tema = null;
     try { tema = localStorage.getItem("dive-tema"); } catch (e) { /* sin storage */ }
     if (tema) document.documentElement.setAttribute("data-theme", tema);

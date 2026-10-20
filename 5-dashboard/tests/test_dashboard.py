@@ -364,9 +364,14 @@ def test_sin_budget_no_se_resuelve_si_no_se_miro_la_management(tmp_path):
     assert _por_fp(base.hallazgos(con, ORG, "2026-10-03T000000Z"))["g"]["presencia"] == "resuelto"
 
 
-def test_verificacion_de_la_skill_en_el_panel(tmp_path):
+def _ins(id_, fps, estado="firma", tipo="hallazgo", prioridad=1, texto="Texto del insight", **extra):
+    return {"id": id_, "tipo": tipo, "estado": estado, "prioridad": prioridad, "titulo": f"Título {id_}", "texto": texto,
+            "alcance": {"nivel": "recurso", "cuenta": "111122223333", "region": "eu-west-1", "fingerprints": fps}, **extra}
+
+
+def test_insights_de_la_skill_en_el_panel(tmp_path):
     a = _f("a" * 16, "volumen suelto")
-    a.update(rule_id="regla.ebs_sin_adjuntar", issue_id="ebs.unattached")          # reversible
+    a.update(rule_id="regla.ebs_sin_adjuntar", issue_id="ebs.unattached")          # reversible, suma
     b = _f("b" * 16, "eip", cat="desperdicio")
     b.update(rule_id="regla.eip_sin_asociar", issue_id="eip.unassociated")         # irreversible
     info = _f("c" * 16, "ipv4", cat="costo")
@@ -376,45 +381,77 @@ def test_verificacion_de_la_skill_en_el_panel(tmp_path):
     con = base.conectar(tmp_path / "db.sqlite")
     base.ingerir(con, [tmp_path])
     r = base.resumen(con, ORG, "2026-10-01T000000Z")
-    assert r["ahorro_seguro_ya"] is None and not r["tiene_informe"]   # sin verificación todavía
+    assert r["ahorro_seguro_ya"] is None and r["insights"] == {"n": 0, "problemas": []}   # la skill aún no concluyó nada
 
-    def escribir(items):
-        (c1 / "verificacion.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "items": items}))
+    def escribir(items, **extra):
+        (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": items, **extra}))
         base.ingerir(con, [tmp_path])
         return _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))
 
-    # La skill escribe verificacion.json e informe-finops.md DESPUÉS: el panel los toma sin reingerir la corrida.
-    h = escribir([{"fingerprint": "a" * 16, "estado": "seguro_ya", "motivo": "available, sin uso", "evidencia": "describe-volumes"},
-                  {"fingerprint": "b" * 16, "estado": "firma", "motivo": "irreversible", "pregunta_dueno": "¿allowlist?"}])
-    (c1 / "informe-finops.md").write_text("# Informe\n<script>alert(1)</script>\n")
-    base.ingerir(con, [tmp_path])
-    assert h["a"]["verificacion"]["estado"] == "seguro_ya" and h["a"]["verificacion"]["vigente"]
-    assert h["b"]["verificacion"]["pregunta"] == "¿allowlist?" and h["c"]["verificacion"] is None
+    cifra = {"c1": {"fuente": "finding:" + "a" * 16 + ".monthly_usd", "formato": "usd"}}
+    # La skill escribe insights.json DESPUÉS: el panel lo toma sin reingerir la corrida. Un "totales" escrito a mano
+    # en el archivo no cuenta: el panel recalcula todo.
+    h = escribir([_ins("I01", ["a" * 16], "seguro_ya", texto="Cuesta {{c1}} al mes", cifras=cifra,
+                       evidencia=[{"id": "E1", "origen": "dive", "descripcion": "available y sin tags"}]),
+                  _ins("I02", ["b" * 16], "firma", prioridad=2, pregunta_dueno="¿allowlist?",
+                       no_determinado="No se sabe si la IP está en un DNS externo.")],
+                 totales={"seguro_ya": 999999})
+    assert h["a"]["insight"]["estado"] == "seguro_ya" and h["a"]["insight"]["vigente"]
+    assert h["a"]["insight"]["valores"] == {"c1": 10.0} and h["a"]["insight"]["cifras"]["c1"]["formato"] == "usd"
+    assert h["b"]["insight"]["pregunta_dueno"] == "¿allowlist?" and h["c"]["insight"] is None
     r = base.resumen(con, ORG, "2026-10-01T000000Z")
-    assert r["ahorro_seguro_ya"] == 10.0 and r["tiene_informe"]
-    assert base.informe(con, ORG, "2026-10-01T000000Z").startswith("# Informe")
-    assert base.informe(con, "o-otraorg123", "2026-10-01T000000Z") is None        # otra organización
+    assert r["ahorro_seguro_ya"] == 10.0 and r["insights"]["n"] == 2        # el monto sale del finding
+    datos = base.insights(con, ORG, "2026-10-01T000000Z")
+    assert datos["totales"]["seguro_ya"] == 10.0 and datos["totales"]["maximo_teorico"] == 20.0
+    assert [i["id"] for i in datos["insights"]] == ["I01", "I02"]            # por prioridad
+    assert base.insights(con, "o-otraorg123", "2026-10-01T000000Z") is None  # otra organización
 
-    # En la corrida siguiente se ve, con su fecha, pero no cuenta en "seguro ya": nadie la re-verificó.
+    # En la corrida siguiente se ve, con su fecha, pero no cuenta en "seguro ya": nadie lo re-analizó.
     h2 = _por_fp(base.hallazgos(con, ORG, "2026-10-02T000000Z"))
-    assert h2["a"]["verificacion"]["corrida"] == "2026-10-01T000000Z" and not h2["a"]["verificacion"]["vigente"]
+    assert h2["a"]["insight"]["corrida"] == "2026-10-01T000000Z" and not h2["a"]["insight"]["vigente"]
     assert base.resumen(con, ORG, "2026-10-02T000000Z")["ahorro_seguro_ya"] is None
 
-    # Las mismas reglas que el validador: un archivo con cualquier ítem inválido no se muestra, ni a medias.
-    for malo in ({"fingerprint": "b" * 16, "estado": "seguro_ya", "motivo": "x"},       # EIP: irreversible
-                 {"fingerprint": "c" * 16, "estado": "seguro_ya", "motivo": "x"},       # IPv4: no suma
-                 {"fingerprint": "f" * 16, "estado": "firma", "motivo": "x"},           # no es de esta corrida
-                 {"fingerprint": "a" * 16, "estado": "firma"}):                         # sin motivo
-        h = escribir([{"fingerprint": "a" * 16, "estado": "seguro_ya", "motivo": "ok"}, malo]
-                     if malo["fingerprint"] != "a" * 16 else [malo])
-        assert all(x["verificacion"] is None for x in h.values()), malo
+    # Un archivo con cualquier ítem inválido no se muestra ni a medias, y el panel dice por qué.
+    for malo in (_ins("I03", ["b" * 16], "seguro_ya"),                                  # EIP: irreversible
+                 _ins("I03", ["c" * 16], "seguro_ya"),                                  # IPv4: no suma
+                 _ins("I03", ["f" * 16]),                                               # fingerprint ajeno
+                 _ins("I03", ["a" * 16], texto="Cuesta $10 al mes"),                    # dinero a mano
+                 _ins("I03", ["a" * 16], cifras={"c1": {"fuente": "total:inventado", "formato": "usd"}}, texto="{{c1}}")):
+        h = escribir([_ins("I01", ["a" * 16], "firma"), malo])
+        assert all(x["insight"] is None for x in h.values()), malo["texto"]
+        res = base.resumen(con, ORG, "2026-10-01T000000Z")["insights"]
+        assert res["n"] == 0 and res["problemas"], malo
 
-    # Si la reescribe, se relee; si la borra, se olvida.
-    h = escribir([{"fingerprint": "a" * 16, "estado": "contradicho", "motivo": "tiene tráfico"}])
-    assert h["a"]["verificacion"]["estado"] == "contradicho"
-    (c1 / "verificacion.json").unlink()
+    # Si lo reescribe, se relee; si lo borra, se olvida.
+    h = escribir([_ins("I01", ["a" * 16], "contradicho", texto="Tiene tráfico")])
+    assert h["a"]["insight"]["estado"] == "contradicho"
+    (c1 / "insights.json").unlink()
     base.ingerir(con, [tmp_path])
-    assert _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))["a"]["verificacion"] is None
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))["a"]["insight"] is None
+    assert base.resumen(con, ORG, "2026-10-01T000000Z")["insights"] == {"n": 0, "problemas": []}
+
+
+def test_evidencia_aws_del_runner_se_valida_en_el_panel(tmp_path):
+    import hashlib
+    a = _f("a" * 16, "volumen")
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a])
+    salida = "RequestCount: 0"
+    (c1 / "aws").mkdir()
+    (c1 / "aws" / "A001.json").write_text(json.dumps({"id": "A001", "salida": salida,
+                                                      "sha256": hashlib.sha256(salida.encode()).hexdigest()}))
+    con = base.conectar(tmp_path / "db.sqlite")
+
+    def con_valor(v):
+        ev = [{"id": "E1", "origen": "aws", "descripcion": "tráfico", "salida_ref": "A001.json", "valores": {"requests": v}}]
+        (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": [
+            _ins("I01", ["a" * 16], evidencia=ev, texto="Tuvo {{c1}} requests",
+                 cifras={"c1": {"fuente": "evidencia:E1.requests", "formato": "num"}})]}))
+        base.ingerir(con, [tmp_path])
+        return base.resumen(con, ORG, "2026-10-01T000000Z")["insights"]
+    assert con_valor(0)["n"] == 1
+    assert con_valor(64100)["n"] == 0                               # el valor no está en la salida guardada
+    (c1 / "aws" / "A001.json").write_text(json.dumps({"id": "A001", "salida": salida + " 64100", "sha256": "x" * 64}))
+    assert con_valor(64100)["n"] == 0                               # salida modificada: no coincide con su hash
 
 
 def test_no_sigue_symlinks_ni_hardlinks(tmp_path):
@@ -458,15 +495,16 @@ def test_fifo_json_patologico_y_carpeta_cambiada_por_link(tmp_path):
     corridas = tmp_path / "runs"
     corridas.mkdir()
     c = _corrida(corridas, "2026-10-01T000000Z", [_f("a" * 16, "x")])
-    os.mkfifo(c / "verificacion.json")                       # un FIFO no bloquea la ingesta
+    os.mkfifo(c / "insights.json")                           # un FIFO no bloquea la ingesta
     os.mkfifo(c / "informe-finops.md")
     con = base.conectar(tmp_path / "db.sqlite")
     base.ingerir(con, [corridas])
     assert not base.resumen(con, ORG, "2026-10-01T000000Z")["tiene_informe"]
-    (c / "verificacion.json").unlink()
-    (c / "verificacion.json").write_text("[" * 200000)       # RecursionError: no tumba el panel
+    (c / "insights.json").unlink()
+    (c / "insights.json").write_text("[" * 200000)           # RecursionError: no tumba el panel, y dice que es inválido
     base.ingerir(con, [corridas])
-    assert _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))["a"]["verificacion"] is None
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))["a"]["insight"] is None
+    assert base.resumen(con, ORG, "2026-10-01T000000Z")["insights"]["problemas"]
     # La carpeta de la corrida se cambia por un link después de la ingesta: el panel no sigue el link.
     (c / "informe-finops.md").unlink()
     afuera = tmp_path / "afuera"
@@ -502,3 +540,106 @@ def test_findings_con_entero_gigante_no_tumba_la_ingesta(tmp_path):
     con = base.conectar(tmp_path / "db.sqlite")
     nuevas, _ = base.ingerir(con, [tmp_path])
     assert nuevas == ["2026-10-02T000000Z"]          # la rota se omite; las demás entran igual
+
+
+def test_servidor_insights_con_token(servidor, tmp_path):
+    p = servidor
+    ruta = f"/api/insights?org={ORG}&run=2026-10-03T000000Z"
+    assert _pedir(p, "GET", ruta)[0] == 403                                            # sin token
+    estado, headers, cuerpo = _pedir(p, "GET", ruta, {"X-DIVE-Token": "TOKEN123"})
+    assert estado == 200 and headers["Content-Type"].startswith("application/json")
+    datos = json.loads(cuerpo)
+    assert datos["insights"] == [] and set(datos["totales"]) >= {"seguro_ya", "maximo_teorico"}
+    assert _pedir(p, "GET", f"/api/insights?org={ORG}&run=../../etc", {"X-DIVE-Token": "TOKEN123"})[0] == 404
+    assert _pedir(p, "GET", f"/api/insights?org=o-otraorg123&run=2026-10-03T000000Z", {"X-DIVE-Token": "TOKEN123"})[0] == 404
+
+
+def test_prioridades_del_resumen(tmp_path):
+    a = _f("a" * 16, "volumen suelto")
+    a.update(rule_id="regla.ebs_sin_adjuntar", issue_id="ebs.unattached")
+    b = _f("b" * 16, "otro")
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b])
+    (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": [
+        _ins("I01", ["a" * 16], "seguro_ya", prioridad=1),
+        {"id": "I02", "tipo": "causa_costo", "prioridad": 2, "alcance": {"nivel": "organizacion"},
+         "titulo": "Causa", "texto": "Texto"},
+        _ins("I03", ["b" * 16], "firma", prioridad=3),
+        {"id": "I04", "tipo": "laguna", "prioridad": 4, "alcance": {"nivel": "organizacion"}, "titulo": "Laguna", "texto": "Texto"},
+        _ins("I05", ["b" * 16], "firma", prioridad=5)]}))
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    r = base.resumen(con, ORG, "2026-10-01T000000Z")
+    assert [i["id"] for i in r["prioridades"]] == ["I01", "I02", "I03"]            # por prioridad, sin lagunas, solo 3
+    assert [i["id"] for i in base.resumen(con, ORG, "2026-10-01T000000Z", "111122223333")["prioridades"]] == ["I01", "I02", "I03"]
+    assert [i["id"] for i in base.resumen(con, ORG, "2026-10-01T000000Z", "444455556666")["prioridades"]] == ["I02"]  # solo la org
+
+
+def test_insights_respetan_el_filtro_de_cuenta(tmp_path):
+    a = _f("a" * 16, "de la cuenta 1")
+    b = {**_f("b" * 16, "de la cuenta 2", usd=5.0), "account_id": "444455556666"}
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b])
+    ins = [_ins("I01", ["a" * 16]), {**_ins("I02", ["b" * 16]), "alcance": {"nivel": "recurso", "cuenta": "444455556666", "fingerprints": ["b" * 16]}},
+           {**_ins("I03", ["a" * 16, "b" * 16]), "alcance": {"nivel": "organizacion", "fingerprints": ["a" * 16, "b" * 16]}},
+           {**_ins("I04", []), "alcance": {"nivel": "organizacion"}, "tipo": "recomendacion"}]
+    (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": ins}))
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    run = "2026-10-01T000000Z"
+    todos = base.insights(con, ORG, run)
+    assert [i["id"] for i in todos["insights"]] == ["I01", "I02", "I03", "I04"] and todos["totales"]["maximo_teorico"] == 15.0
+    uno = base.insights(con, ORG, run, "111122223333")
+    assert [i["id"] for i in uno["insights"]] == ["I01", "I03", "I04"]        # sin el de la otra cuenta; el de la org se queda
+    assert uno["totales"]["maximo_teorico"] == 10.0                           # los totales también son de la cuenta
+    assert {i["id"]: i["n_cuentas"] for i in uno["insights"]} == {"I01": 1, "I03": 2, "I04": 0}
+    assert [i["id"] for i in base.insights(con, ORG, run, "777788889999")["insights"]] == ["I04"]
+
+
+def test_resumen_trae_lo_que_no_cuelga_de_un_hallazgo(tmp_path):
+    a = _f("a" * 16, "algo")
+    b = {**_f("b" * 16, "de otra cuenta"), "account_id": "444455556666"}
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b])
+    laguna = {**_ins("I09", []), "tipo": "laguna", "estado": "informativo", "alcance": {"nivel": "organizacion"}}
+    otra = {**_ins("I08", []), "alcance": {"nivel": "cuenta", "cuenta": "444455556666"}}
+    (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": [_ins("I01", ["a" * 16]), laguna, otra]}))
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    run = "2026-10-01T000000Z"
+    assert [i["id"] for i in base.resumen(con, ORG, run)["aparte"]] == ["I08", "I09"]       # sin hallazgo: van en Resumen
+    assert [i["id"] for i in base.resumen(con, ORG, run, "111122223333")["aparte"]] == ["I09"]  # la de otra cuenta, fuera
+
+
+def test_en_una_fila_gana_el_insight_que_cambia_la_decision_no_el_mas_general(tmp_path):
+    a = _f("a" * 16, "volumen")
+    a.update(rule_id="regla.ebs_sin_adjuntar", issue_id="ebs.unattached")
+    b = _f("b" * 16, "otro")
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b])
+    general = {**_ins("I01", ["a" * 16, "b" * 16], "informativo", tipo="causa_costo", prioridad=1),
+               "alcance": {"nivel": "organizacion", "fingerprints": ["a" * 16, "b" * 16]}}
+    firma = _ins("I02", ["a" * 16], "firma", prioridad=5)
+    solo_info = {**_ins("I03", ["b" * 16], "informativo", tipo="causa_costo", prioridad=2)}   # lo tapa I01 en su única fila
+    (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": [general, firma, solo_info]}))
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    h = _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))
+    assert h["a"]["insight"]["id"] == "I02"                       # firma (prio 5) gana al informativo general (prio 1)
+    assert h["b"]["insight"]["id"] == "I01"                       # entre dos informativos, la prioridad
+    # I03 no gana en ninguna fila: no se pierde, pasa a "aparte" del Resumen.
+    assert [i["id"] for i in base.resumen(con, ORG, "2026-10-01T000000Z")["aparte"]] == ["I03"]
+
+
+def test_el_informe_solo_vale_si_sale_del_insights_json_actual(tmp_path):
+    import hashlib
+    a = _f("a" * 16, "algo")
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a])
+    contenido = json.dumps({"run_id": "2026-10-01T000000Z", "insights": [_ins("I01", ["a" * 16])]})
+    (c1 / "insights.json").write_text(contenido)
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    run = "2026-10-01T000000Z"
+    sha = hashlib.sha256(contenido.encode()).hexdigest()
+    assert base.informe_actual(con, run, f"# Informe\n<!-- insights-sha256: {sha} -->\n")
+    assert not base.informe_actual(con, run, "# Informe sin marca")
+    assert not base.informe_actual(con, run, f"# Informe\n<!-- insights-sha256: {'0' * 64} -->\n")
+    (c1 / "insights.json").write_text(contenido.replace("Texto del insight", "Otro texto"))   # se edita después
+    base.ingerir(con, [tmp_path])
+    assert not base.informe_actual(con, run, f"# Informe\n<!-- insights-sha256: {sha} -->\n")

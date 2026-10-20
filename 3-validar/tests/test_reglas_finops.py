@@ -36,7 +36,7 @@ def precios(*claves):
 
 def correr(regla, recursos, con_precios=None):
     ctx = {"ahora": None, "precios": con_precios or {}}
-    return [completar_v2({**f, "rule_id": "regla." + regla.__name__.removeprefix("regla_")})
+    return [completar_v2({"rule_id": "regla." + regla.__name__.removeprefix("regla_"), **f})
             for f in regla(recursos, ctx)]
 
 
@@ -337,3 +337,24 @@ def test_solo_budgets_de_costo_cubren():
     sp = _budget("900000000000", "cobertura SP", tipo="SAVINGS_PLANS_COVERAGE")  # sin filtro, pero no vigila gasto
     uso = _budget("111111111111", "horas", tipo="USAGE")
     assert _sin_budget(_inv_budgets([sp, uso], todas)) == sorted(todas)
+
+
+def test_ipv4_gestionadas_por_un_servicio_van_aparte_y_no_se_cuentan_como_propias():
+    recursos = [r("ec2", "instance", "i-1", "running", public_ip="198.51.100.1"),
+                r("eip", "elastic_ip", "eip-1", associated=True, public_ip="198.51.100.1"),              # la de i-1
+                r("eip", "elastic_ip", "eip-2", associated=True, public_ip="198.51.100.2", service_managed="alb"),
+                r("eip", "elastic_ip", "eip-3", associated=True, public_ip="198.51.100.3", service_managed="alb"),
+                r("eip", "elastic_ip", "eip-4", associated=True, public_ip="198.51.100.4", service_managed="rds")]
+    fs = {f["rule_id"]: f for f in correr(reglas.regla_ipv4_publica, recursos, precios("ipv4_hora"))}
+    assert fs["regla.ipv4_publica"]["title"] == "IPv4 públicas en uso (1)"
+    g = fs["regla.ipv4_gestionada"]
+    assert g["title"] == "IPv4 públicas gestionadas por un servicio (3)" and "2 alb, 1 rds" in g["detail"]
+    assert round(g["monthly_usd"], 2) == 10.95 and g["is_saving"] is False
+
+
+def test_ipv4_una_eip_gestionada_de_un_nat_no_se_cuenta_dos_veces():
+    recursos = [r("eip", "elastic_ip", "eip-1", associated=True, public_ip="198.51.100.9", service_managed="rnat"),
+                _nat("nat-a", "vpc-a")]
+    recursos[1]["attrs"]["public_ips"] = ["198.51.100.9", "198.51.100.8"]
+    fs = {f["rule_id"]: f for f in correr(reglas.regla_ipv4_publica, recursos, precios("ipv4_hora"))}
+    assert fs["regla.ipv4_publica"]["title"] == "IPv4 públicas en uso (1)" and fs["regla.ipv4_gestionada"]["title"].endswith("(1)")

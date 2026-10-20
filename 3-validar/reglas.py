@@ -7,6 +7,7 @@ Los attrs se leen con .get() defensivo: si un colector no trae el dato, la regla
 Uso: from reglas import aplicar; findings = aplicar(inventory)
 """
 
+from collections import Counter
 from datetime import datetime, timezone
 
 from common.precios import CONSULTAS, precio
@@ -464,26 +465,45 @@ def regla_nat_sin_endpoint(recursos, ctx):
 def regla_ipv4_publica(recursos, ctx):
     """Desde feb/2024 AWS cobra cada IPv4 pública por hora, esté o no asociada. Se cuentan IPs distintas por
     cuenta × región (una EIP asociada es también la public_ip de la instancia o del NAT). Es gasto
-    informativo, no un ahorro, y es un mínimo: los load balancers públicos también usan IPv4 y no se cuentan."""
-    ips = {}
+    informativo, no un ahorro, y es un mínimo: solo entran las IPs que ve el inventario (instancias, EIPs, NAT).
+    Las que gestiona un servicio (EIP con `service_managed`: alb, nlb, rds…) van aparte: AWS las asigna y no se
+    pueden liberar; se reducen cambiando el servicio."""
+    propias, gestionadas = {}, {}
     for r in recursos:
         a = _attrs(r)
         llave = (r["account_id"], r["region"])
         if _es(r, {"ec2"}, "instance") and r.get("state") == "running" and a.get("public_ip"):
-            ips.setdefault(llave, set()).add(a["public_ip"])
+            propias.setdefault(llave, set()).add(a["public_ip"])
         elif _es(r, {"eip", "ec2"}, "elastic_ip") and a.get("associated") and a.get("public_ip"):
-            ips.setdefault(llave, set()).add(a["public_ip"])
+            if a.get("service_managed"):
+                gestionadas.setdefault(llave, {})[a["public_ip"]] = a["service_managed"]
+            else:
+                propias.setdefault(llave, set()).add(a["public_ip"])
         elif _es(r, {"vpc"}, "nat_gateway") and r.get("state") in (None, "available"):
-            ips.setdefault(llave, set()).update(a.get("public_ips") or [])
+            propias.setdefault(llave, set()).update(a.get("public_ips") or [])
+    for llave, ips in gestionadas.items():  # un NAT con una EIP gestionada la tendría también como propia
+        if llave in propias:
+            propias[llave] -= set(ips)
+    propias = {k: v for k, v in propias.items() if v}
     out = []
-    for (cuenta, region), conjunto in sorted(ips.items()):
+    for (cuenta, region), conjunto in sorted(propias.items()):
         hora, fuente = _precio(ctx, region, "ipv4_hora", PRECIO_IPV4_HORA)
         out.append(hallazgo("costo", "baja", cuenta, region, None, f"IPv4 públicas en uso ({len(conjunto)})",
-                            f"{len(conjunto)} IPv4 públicas (instancias, EIPs asociadas y NAT), "
+                            f"{len(conjunto)} IPv4 públicas propias (instancias, EIPs que asignaste y NAT), "
                             f"{_texto_precio(hora, 'hora', fuente)} × {HORAS_MES} h cada una. Es gasto, no ahorro; "
-                            "mínimo (sin las de load balancers públicos). Revisar si cada una necesita IP pública "
+                            "mínimo (solo las que ve el inventario). Revisar si cada una necesita IP pública "
                             "(SSM Session Manager, ALB o IPv6 en su lugar).", hora * HORAS_MES * len(conjunto), FUENTE,
                             price_source=fuente, ahorro=False))
+    for (cuenta, region), ips in sorted(gestionadas.items()):
+        hora, fuente = _precio(ctx, region, "ipv4_hora", PRECIO_IPV4_HORA)
+        por_servicio = ", ".join(f"{n} {sv}" for sv, n in sorted(Counter(ips.values()).items()))
+        out.append(hallazgo("costo", "baja", cuenta, region, None, f"IPv4 públicas gestionadas por un servicio ({len(ips)})",
+                            f"{len(ips)} IPv4 públicas que asigna y gestiona un servicio de AWS ({por_servicio}), "
+                            f"{_texto_precio(hora, 'hora', fuente)} × {HORAS_MES} h cada una. No se pueden liberar: AWS las cobra "
+                            "mientras exista el servicio. Se reducen quitando balanceadores que no hagan falta, usando menos "
+                            "subnets (zonas) en un ALB o haciendo no pública una base RDS. Es gasto, no ahorro.",
+                            hora * HORAS_MES * len(ips), FUENTE, price_source=fuente, ahorro=False,
+                            rule_id="regla.ipv4_gestionada"))
     return out
 
 

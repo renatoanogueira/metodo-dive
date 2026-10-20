@@ -27,7 +27,7 @@ CUENTA, REGION = "111111111111", "eu-west-1"
 def _rule_ids_posibles():
     """Todos los rule_id que el código puede emitir (por familia)."""
     ids = {f"regla.{r.__name__.removeprefix('regla_')}" for r in reglas.REGLAS} - {"regla.root"}
-    ids |= set(re.findall(r'rule_id="(regla\.[a-z_]+)"', (RAIZ / "3-validar" / "reglas.py").read_text()))
+    ids |= set(re.findall(r'rule_id="(regla\.[a-z0-9_]+)"', (RAIZ / "3-validar" / "reglas.py").read_text()))
     ids |= {f"aws-doctor.{c}" for c in doctor.CATEGORIAS}
     ids |= set(re.findall(r'"(cruce\.[a-z_]+)"', (RAIZ / "3-validar" / "validar.py").read_text()))
     ids |= {f"finops.{n}" for n in re.findall(r"\{FUENTE\}\.([a-z_]+)", (RAIZ / "3-validar" / "hallazgos_finops.py").read_text())}
@@ -188,22 +188,6 @@ def test_coincide_por_arn_y_ids_dinamicos_de_coh():
         assert resumen.reversibilidad({"rule_id": rid}) == esperado, rid
 
 
-def test_verificacion_json_hace_anonimizar_al_creador(tmp_path):
-    """El creador de CloudTrail que la skill escribe en el informe se anonimiza si va también en
-    verificacion.json (clave created_by), como pide SKILL.md."""
-    sys.path.insert(0, str(RAIZ / "anonimizar"))
-    import subprocess
-    (tmp_path / "corrida").mkdir()
-    c = tmp_path / "corrida"
-    (c / "discovery.json").write_text(json.dumps({"run": {"org_alias": "acme"}, "accounts": {}}))
-    (c / "verificacion.json").write_text(json.dumps({"items": [{"id": "F001", "created_by": "jperez-admin"}]}))
-    (c / "informe-finops.md").write_text("- Creado por:     jperez-admin (CloudTrail)\n")
-    r = subprocess.run([sys.executable, "-I", str(RAIZ / "anonimizar" / "anonimizar.py"), "--termino", "acme",
-                        str(c)], capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "jperez-admin" not in (tmp_path / "corrida-anon" / "informe-finops.md").read_text()
-
-
 def test_desperdicio_sin_monto_hace_solapado_no_diferido(tmp_path):
     from hallazgos import hallazgo
     ociosa = hallazgo("desperdicio", "media", CUENTA, REGION, "i-1", "ociosa", "d", None, "aws-doctor",
@@ -261,69 +245,24 @@ def test_prefijos_de_comandos_funcionan_en_zsh_y_bash(tmp_path):
     assert "$LEER" not in texto and "$ESCRIBIR" not in texto
 
 
-# ---------- verificacion.json ----------
-
-def _corrida_con_run(tmp_path):
+def test_grupos_dan_los_fingerprints_de_todo_lo_citable(tmp_path):
     findings = _corrida(tmp_path)
-    doc = json.loads((tmp_path / "findings.json").read_text())
-    doc["run"] = {"run_id": "2026-10-18T000000Z"}
-    (tmp_path / "findings.json").write_text(json.dumps(doc))
-    return {f["rule_id"]: f for f in findings}
+    r = resumen.resumir(tmp_path)
+    por_regla = {g["rule_id"]: g for g in r["grupos"]}
+    assert set(por_regla) == {f["rule_id"] for f in findings}
+    vol = por_regla["regla.ebs_sin_adjuntar"]
+    assert vol["fingerprints"] == [f["fingerprint"] for f in findings if f["rule_id"] == "regla.ebs_sin_adjuntar"]
+    assert vol["fp_con_monto"] == vol["fingerprints"] and vol["suma_usd"] == 10.0 and vol["suma_como_ahorro"]
+    assert vol["reversibilidad"] == "reversible" and vol["cuentas"] == ["111111111111"] and not vol["truncado"]
+    ipv4 = por_regla["regla.ipv4_publica"]
+    assert not ipv4["suma_como_ahorro"] and ipv4["reversibilidad"] == "informativo"
+    assert r["grupos"] == sorted(r["grupos"], key=lambda g: (-g["suma_usd"], -g["n"], g["rule_id"]))
 
 
-def test_verificacion_valida_y_reglas_de_seguro_ya(tmp_path):
-    import verificacion
-    f = _corrida_con_run(tmp_path)
-    vol, eip = f["regla.ebs_sin_adjuntar"], f["regla.eip_sin_asociar"]
-
-    def escribir(items, run_id="2026-10-18T000000Z"):
-        (tmp_path / "verificacion.json").write_text(json.dumps({"run_id": run_id, "items": items}))
-        return verificacion.validar(tmp_path)
-
-    validos, problemas = escribir([{"fingerprint": vol["fingerprint"], "estado": "seguro_ya", "motivo": "available"},
-                                   {"fingerprint": eip["fingerprint"], "estado": "firma", "motivo": "irreversible",
-                                    "pregunta_dueno": "¿está en una allowlist?"}])
-    assert not problemas and len(validos) == 2
-    # Una EIP (irreversible) no puede ser seguro_ya, aunque sume.
-    _, problemas = escribir([{"fingerprint": eip["fingerprint"], "estado": "seguro_ya", "motivo": "x"}])
-    assert problemas and "no puede ser seguro_ya" in problemas[0]
-    # La IPv4 no suma: tampoco.
-    _, problemas = escribir([{"fingerprint": f["regla.ipv4_publica"]["fingerprint"], "estado": "seguro_ya", "motivo": "x"}])
-    assert "no puede ser seguro_ya" in problemas[0]
-    for malo, texto in (({"fingerprint": "zz", "estado": "firma", "motivo": "x"}, "fingerprint inválido"),
-                        ({"fingerprint": "0" * 16, "estado": "firma", "motivo": "x"}, "no está en findings.json"),
-                        ({"fingerprint": vol["fingerprint"], "estado": "listo", "motivo": "x"}, "estado"),
-                        ({"fingerprint": vol["fingerprint"], "estado": "firma"}, "falta motivo"),
-                        ({"fingerprint": vol["fingerprint"], "estado": "firma", "motivo": "x" * 600}, "500")):
-        _, problemas = escribir([malo])
-        assert problemas and texto in problemas[0], (malo, problemas)
-    _, problemas = escribir([], run_id="otra")
-    assert "run_id" in problemas[0]
-
-
-def test_verificacion_cli(tmp_path, monkeypatch, capsys):
-    import verificacion
-    f = _corrida_con_run(tmp_path)
-    (tmp_path / "verificacion.json").write_text(json.dumps({"run_id": "2026-10-18T000000Z", "items": [
-        {"fingerprint": f["regla.ebs_sin_adjuntar"]["fingerprint"], "estado": "seguro_ya", "motivo": "available"}]}))
-    monkeypatch.setattr(sys, "argv", ["verificacion.py", str(tmp_path)])
-    assert verificacion.main() == 0
-    assert "ahorro seguro ya $10.00/mes" in capsys.readouterr().out
-
-
-def test_validador_rechaza_symlink(tmp_path):
-    import verificacion
-    _corrida_con_run(tmp_path)
-    fuera = tmp_path.parent / f"{tmp_path.name}-fuera.json"
-    fuera.write_text(json.dumps({"run_id": "2026-10-18T000000Z", "items": []}))
-    (tmp_path / "verificacion.json").symlink_to(fuera)
-    _, problemas = verificacion.validar(tmp_path)
-    assert problemas and "symlink" in problemas[0]
-
-
-def test_validador_con_json_patologico_no_revienta(tmp_path, monkeypatch):
-    import verificacion
-    _corrida_con_run(tmp_path)
-    (tmp_path / "verificacion.json").write_text("[" * 200000)
-    monkeypatch.setattr(sys, "argv", ["verificacion.py", str(tmp_path)])
-    assert verificacion.main() == 2
+def test_un_grupo_mixto_separa_los_fingerprints_que_suman_como_ahorro():
+    f = lambda fp, ahorro: {"rule_id": "aws-doctor.unused_amis", "fingerprint": fp, "monthly_usd": 5.0, "is_saving": ahorro,
+                            "category": "desperdicio", "title": "AMI", "account_id": "1", "region": "r"}
+    [g] = resumen._grupos([f("a" * 16, True), f("b" * 16, False)])
+    assert g["mixto"] is True and g["fp_ahorro"] == ["a" * 16] and len(g["fp_con_monto"]) == 2 and g["suma_usd"] == 10.0
+    [g] = resumen._grupos([f("a" * 16, True)])
+    assert g["mixto"] is False

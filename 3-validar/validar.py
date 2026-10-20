@@ -31,6 +31,7 @@ sys.path.insert(0, str(AQUI))
 from common import (SERVICIOS_GOBIERNO, _base_salida, ahora, cargar_config, corrida_actual, error_corto,  # noqa: E402
                     escribir_json, heredar_run, leer_json, moneda_de_pago)
 
+import amis  # noqa: E402
 import doctor  # noqa: E402
 import hallazgos_finops  # noqa: E402
 import reglas  # noqa: E402
@@ -342,7 +343,7 @@ def precios_de_la_corrida(cfg, inventory, salida):
 
 
 def validar(cfg, discovery, inventory, salida, sin_doctor=False, timeout_doctor=900, consultar_precios=False,
-            precios=None):
+            precios=None, lector_amis=None):
     """Corre las tres fuentes y escribe findings.json + findings.md en `salida`. Con `consultar_precios`
     pide los precios a la Price List API; `precios` permite pasarlos ya resueltos (tests)."""
     salida = Path(salida)
@@ -374,13 +375,15 @@ def validar(cfg, discovery, inventory, salida, sin_doctor=False, timeout_doctor=
                        if c.get("enabled_regions")}
         f_doc, e_doc = doctor.ejecutar(cfg, discovery, salida, timeout=timeout_doctor, creds_fn=creds_fn,
                                        habilitadas=habilitadas)
-        findings += f_doc
+        # Las AMIs "sin uso" se confirman con su último lanzamiento (aws-doctor no lo mira).
+        findings += amis.refinar(cfg, f_doc, errores, lector=lector_amis)
         errores += e_doc
 
     # Cost Optimization Hub primero: en el dedup, su monto (neto de compromisos) es el que cuenta para el recurso.
     findings = hallazgos_finops.hallazgos(discovery, inventory) + hallazgos_finops.ajustar_por_compromisos(findings, discovery)
     findings += cruce_billing(discovery, inventory, cargar_colectores())
     findings += reglas.aplicar(inventory, precios)
+    findings = amis.marcar_aws_backup(findings, inventory)
     findings = ordenar_y_numerar(deduplicar(findings))
 
     # "errors" es adicional al contrato: corridas de aws-doctor que fallaron.

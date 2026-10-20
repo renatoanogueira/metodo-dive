@@ -1,9 +1,7 @@
-"""Reglas compartidas de la verificación de la skill metodo-dive (verificacion.json): la reversibilidad de cada
-tipo de problema y la validación de cada ítem.
+"""Piezas compartidas por la skill metodo-dive, su resumen y el dashboard: la reversibilidad de cada tipo de
+problema, los estados de una verificación y la lectura segura de archivos y JSON de una corrida.
 
-Las usan el validador de la skill (skill/scripts/verificacion.py), su resumen (skill/scripts/resumen.py) y el
-dashboard (5-dashboard/base.py). Así el panel nunca muestra como "seguro ya" algo que el validador rechazaría,
-aunque el archivo no se haya validado.
+El contrato de lo que concluye la skill (insights.json) está en common/insights.py.
 """
 
 import json
@@ -35,6 +33,7 @@ REVERSIBILIDAD = {
     "regla.lambda_x86": "reinicio",
     "regla.ec2_generacion_antigua": "reinicio",
     "regla.ipv4_publica": "informativo",
+    "regla.ipv4_gestionada": "informativo",
     "regla.sg_abierto": "informativo",
     "regla.rds_publico": "informativo",
     "regla.rds_sin_cifrar": "informativo",
@@ -109,58 +108,6 @@ ESTADOS = {
     "no_verificado": "no se pudo verificar (sin permiso, sin datos)",
 }
 RE_FINGERPRINT = re.compile(r"[0-9a-f]{16}")
-LARGOS = {"motivo": 500, "pregunta_dueno": 500, "evidencia": 2000, "created_by": 200, "owner": 200, "id": 16}
-MAX_ARCHIVO = 2_000_000  # bytes de verificacion.json
-
-
-def revisar(datos, run_id, findings_por_fp):
-    """Valida verificacion.json ya parseado contra los findings de su corrida ({fingerprint: finding}).
-    → (ítems válidos, problemas). Un archivo con cualquier problema no se publica: ni el validador ni el panel
-    lo aceptan a medias."""
-    if not isinstance(datos, dict):
-        return [], ["verificacion.json falta, está roto o no es un objeto"]
-    problemas = []
-    if datos.get("run_id") != run_id:
-        problemas.append(f"run_id {datos.get('run_id')!r} no es el de findings.json ({run_id!r})")
-    items = datos.get("items")
-    if not isinstance(items, list):
-        return [], problemas + ["items debe ser una lista"]
-    vistos, validos = set(), []
-    for n, it in enumerate(items):
-        donde = f"items[{n}]"
-        if not isinstance(it, dict):
-            problemas.append(f"{donde}: no es un objeto")
-            continue
-        fp = it.get("fingerprint")
-        if not isinstance(fp, str) or not RE_FINGERPRINT.fullmatch(fp):
-            problemas.append(f"{donde}: fingerprint inválido {fp!r}")
-            continue
-        if fp in vistos:
-            problemas.append(f"{donde}: fingerprint {fp} repetido")
-            continue
-        vistos.add(fp)
-        f = findings_por_fp.get(fp)
-        if f is None:
-            problemas.append(f"{donde}: fingerprint {fp} no está en findings.json de esta corrida")
-            continue
-        estado = it.get("estado")
-        if estado not in ESTADOS:
-            problemas.append(f"{donde}: estado {estado!r} no es uno de {sorted(ESTADOS)}")
-            continue
-        if estado == "seguro_ya" and not (f.get("is_saving") and monto(f) and reversibilidad(f) == "reversible"):
-            problemas.append(f"{donde}: {f.get('id')} no puede ser seguro_ya (is_saving={bool(f.get('is_saving'))}, "
-                             f"reversibilidad={reversibilidad(f)}); usa firma")
-            continue
-        malo = next((c for c, largo in LARGOS.items() if it.get(c) is not None
-                     and (not isinstance(it.get(c), str) or len(it[c]) > largo)), None)
-        if malo:
-            problemas.append(f"{donde}: {malo} debe ser texto de hasta {LARGOS[malo]} caracteres")
-            continue
-        if not (it.get("motivo") or "").strip():
-            problemas.append(f"{donde}: falta motivo")
-            continue
-        validos.append(it)
-    return validos, problemas
 
 
 _FLAGS_ARCHIVO = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)

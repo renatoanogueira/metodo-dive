@@ -9,27 +9,28 @@ Para cada `issue_id` / `rule_id` de DIVE:
 
 La reversibilidad de cada título es la que usa `scripts/resumen.py` (tabla `REVERSIBILIDAD`).
 
-## Cómo se escriben los comandos
+## Cómo se usa este archivo
 
-- **Lectura (el agente):** cada comando empieza con
-  `AWS_CONFIG_FILE="$HOME/.aws/dive-config" aws --profile "dive-$CUENTA" --region "$R"` (modo `sso`). En
-  `assume_role`, con el perfil que asuma `scan_role_name`. Abajo se abrevia **`LEER`**: escríbelo entero, no lo
-  guardes en una variable. zsh no separa una variable en palabras, y la herramienta Bash no conserva variables
-  entre llamadas.
-- **Escritura (solo la persona):** `aws --profile "<perfil-con-escritura>" --region "$R"`. Abajo se abrevia
-  **`ESCRIBIR`**.
-- `CUENTA`, `R`, `ID`, `INI` y `FIN` se definen **en la misma llamada**, con comillas simples, ej.
-  `CUENTA='123456789012' R='eu-west-1' ID='vol-0abc'; AWS_CONFIG_FILE=…`.
-- **Valores que se pueden pegar.** Solo los que tengan el formato de su tipo (ver SKILL.md); cualquier otro texto
-  de la cuenta no se pega:
-  - IDs de AWS (`vol-…`, `snap-…`, `i-…`, `eipalloc-…`, `arn:aws:…`);
-  - IPv4;
-  - nombres de bucket, RDS, LB, log group o secreto.
-- En el informe, los comandos van así, abreviados o con `~/.aws/dive-config`, nunca con la ruta de tu home.
+- **Verificar:** qué comprobar y con qué consulta. Los comandos están escritos como `aws …` para que se entienda
+  qué se mira; **la skill no los ejecuta**: si le falta uno de esos datos, lo pide con
+  `skill/scripts/aws_leer.py` (servicio, operación en snake_case y parámetros en JSON; ej. `aws cloudtrail
+  lookup-events --lookup-attributes …` → `cloudtrail lookup_events '{"LookupAttributes": [...]}'`). El runner usa el
+  perfil de solo lectura de DIVE y guarda la salida. Si la corrida ya trae el dato (estado, tags, precio), no se
+  consulta.
+- **Acción:** el comando para **una persona**, con un perfil con permiso de escritura
+  (`aws --profile "<perfil-con-escritura>" --region "<región>" …`). **La skill no lo ejecuta nunca**: lo copia en
+  `accion.comando` con los IDs ya puestos.
+- **Deshacer:** cómo revertirlo.
+- Los valores se pegan solo si tienen el formato de su tipo (IDs de AWS, IPv4, nombres de bucket, RDS, LB, log
+  group o secreto, ver SKILL.md). Cualquier otro texto de la cuenta no se pega.
+- Si el recurso lo gestiona IaC (`iac` en el resumen, o tags `aws:cloudformation:*` o de Terraform), o si `iac` es
+  `desconocido` y el dueño dice que está en código, la acción va en la plantilla o el módulo, no en la CLI (si no,
+  hay drift).
+- La reversibilidad de cada título es la que usa `scripts/resumen.py` (tabla en `common/verificacion.py`).
 
-Si el recurso lo gestiona IaC (`iac` en el resumen, o tags `aws:cloudformation:*` o de Terraform), o si `iac` es
-`desconocido` y el dueño dice que está en código, la acción va en la plantilla o el módulo, no en la CLI (si no,
-hay drift).
+Variables que se usan en los comandos de abajo: `$CUENTA`, `$R` (región), `$ID` (el `resource_id`), `$INI` y `$FIN`
+(una ventana de 30 días en ISO 8601). En los comandos de **verificación** que se leen aquí, `LEER` es solo una
+abreviatura de "consulta de lectura": se hace por el runner, nunca a mano.
 
 ## Volumen EBS sin adjuntar · `ebs.unattached` · reversible
 
@@ -83,6 +84,21 @@ hay drift).
   - **Archive:** guarda una copia completa. Para un incremental puede costar **más** que dejarlo en standard. Tiene mínimo de 90 días, se restaura en 24–72 h y cobra la recuperación por GB. Solo conviene para snapshots completos que se guardan mucho tiempo.
 - **Acción:** `ESCRIBIR ec2 delete-snapshot --snapshot-id "$ID"`. Alternativa para un snapshot completo de larga retención: `ESCRIBIR ec2 modify-snapshot-tier --snapshot-id "$ID" --storage-tier archive`.
 - **Deshacer:** un snapshot borrado no se recupera. Uno en archive, con `restore-snapshot-tier`.
+
+## AMI sin uso · `aws-doctor.unused_amis` · irreversible
+
+- **Qué trae el finding:** DIVE ya consultó el último lanzamiento (`last_launched=` en el `detail`), así que no lo repitas.
+  aws-doctor solo mira que ninguna instancia la tenga ahora y su antigüedad; no mira lanzamientos pasados.
+  - `gestionada=aws_backup` (nombre `AwsBackup_…`): no suma. La retira la retención del vault, no `deregister-image`.
+  - Título "lanzada hace N días": no suma, es uso puntual (runners, restores, launch templates).
+  - "sin lanzamientos registrados" o "sin lanzar hace N días" (más de 30): candidata. EC2 solo registra lanzamientos desde que existe el atributo: "sin registros" no prueba que nunca se usó. Una versión vieja con sucesora (V3 junto a V4)
+    cae aquí tras ese plazo, pero confirma con el dueño que la sucesora ya está en uso.
+  - `last_launched=no verificado`: no se pudo leer; no la propongas como segura.
+- **Verificar:** `LEER ec2 describe-images --image-ids "$ID" --query 'Images[0].[Name,CreationDate,Tags]'`. Que ningún launch template o ASG la
+  nombre: `LEER autoscaling describe-auto-scaling-groups` (el finding no lo mira). Los launch templates no se pueden leer con el runner (sus versiones traen `UserData` y el rol de auditoría lo tiene denegado a propósito): pregunta al dueño si algún template la usa.
+- **Acción:** `ESCRIBIR ec2 deregister-image --image-id "$ID"`; después, borrar sus snapshots (`delete-snapshot`) para dejar de pagarlos: la AMI sola no libera nada.
+- **Deshacer:** no hay; una AMI desregistrada no se recupera (los snapshots sí sirven para registrar otra, mientras existan).
+- **El monto es un tope:** son los snapshots de la AMI, y un snapshot incremental cobra solo sus bloques únicos.
 
 ## Instancia detenida · `ec2.stopped` · irreversible
 

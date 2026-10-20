@@ -164,41 +164,74 @@ Campos v2 (aditivos) de cada finding:
 - `errors`: corridas de aws-doctor que fallaron, checks de aws-doctor que fallaron (`aws-doctor/<check>`) y categorías de aws-doctor que `doctor.py` no conoce (señal de que hay que actualizar `CATEGORIAS`).
 - Si un recurso tiene un finding de `desperdicio`, sus findings de `costo` se descartan: el ahorro es borrarlo, no optimizarlo. Los totales de `findings.md` y `reporte.html` suman solo `desperdicio` + `costo`.
 
-## verificacion.json (skill metodo-dive, opcional)
+## insights.json (skill metodo-dive, opcional)
 
-Lo que la skill averiguó en la pasada escéptica. Lo escribe en la carpeta de la corrida y lo valida con
-`skill/scripts/verificacion.py`. El dashboard lo lee aunque la corrida ya estuviera ingerida (lo relee si cambia).
+Lo que la skill concluye al analizar la corrida, estructurado. Lo escribe la skill en la carpeta de la corrida y lo
+valida `skill/scripts/insights.py`, que además calcula los totales y exporta `informe-finops.md` (un derivado: lo
+que muestra el dashboard sale de `insights.json`, nunca del `.md`). El dashboard lo lee aunque la corrida ya
+estuviera ingerida (lo relee si cambia) y lo valida otra vez con las mismas reglas (`common/insights.py`).
 
 ```json
 {
   "run_id": "2026-10-18T194232Z",
   "generado": "2026-10-18T20:00:00Z",
-  "items": [
-    {"fingerprint": "a1b2c3d4e5f60718", "id": "F031", "estado": "seguro_ya",
-     "motivo": "available, sin tags ni eventos en 90 días", "pregunta_dueno": null,
-     "evidencia": "describe-volumes → available; lookup-events → sin eventos", "created_by": null, "owner": null}
+  "insights": [
+    {"id": "I01", "tipo": "hallazgo", "estado": "firma", "prioridad": 2,
+     "alcance": {"nivel": "recurso", "cuenta": "123456789012", "region": "eu-west-1", "fingerprints": ["a1b2c3d4e5f60718"]},
+     "titulo": "Load balancer sin tráfico",
+     "texto": "Cuesta {{c1}} al mes y tuvo {{c2}} requests en 30 días.",
+     "cifras": {"c1": {"fuente": "finding:a1b2c3d4e5f60718.monthly_usd", "formato": "usd"},
+                "c2": {"fuente": "evidencia:E1.requests", "formato": "num"}},
+     "evidencia": [{"id": "E1", "origen": "aws", "descripcion": "RequestCount de 30 días",
+                    "salida_ref": "A001.json", "valores": {"requests": 0}}],
+     "no_determinado": "Con tráfico cero no se distingue una operación pequeña de un recurso abandonado.",
+     "pregunta_dueno": "¿El entorno está apagado a propósito?",
+     "accion": {"comando": "aws --profile '<perfil-con-escritura>' elbv2 delete-load-balancer --load-balancer-arn '<arn>'",
+                "reversibilidad": "irreversible"}}
   ]
 }
 ```
 
-- `run_id`: el de `findings.json`. `fingerprint`: el del finding; la verificación sigue al problema entre
-  corridas, no al `id`.
-- `estado`:
-  - `seguro_ya`: reversible y re-verificado. Solo vale en un finding con `is_saving` y monto, de un tipo de
-    problema reversible.
-  - `firma`: verificado, pero necesita la decisión del dueño.
-  - `contradicho`: la verificación lo desmiente.
-  - `no_verificado`: no se pudo verificar.
-- `motivo` (obligatorio, hasta 500 caracteres), `pregunta_dueno` (500), `evidencia` (2000).
-- `created_by` / `owner`: nombres de personas. Van aquí para que el anonimizador los aprenda y los reemplace
-  también en `informe-finops.md`.
-- En el dashboard:
-  - Cada finding muestra la verificación más reciente hasta esa corrida.
-  - Una verificación de una corrida anterior se ve atenuada y con su fecha, y no cuenta en "Ahorro seguro ya": el
-    recurso pudo cambiar.
-  - "Ahorro seguro ya" suma los `seguro_ya` abiertos verificados en esa misma corrida.
-  - Las reglas son las mismas que las del validador (`common/verificacion.py`): un archivo con cualquier problema
-    no se muestra, ni a medias.
-  - `verificacion.json` e `informe-finops.md` no se leen si son symlinks o hardlinks. Tampoco si pesan más de
-    2 MB y 1 MB, respectivamente.
-  - El informe se ve como texto en la pestaña Informe.
+- `tipo`: `hallazgo`, `causa_costo`, `recomendacion`, `pregunta` o `laguna` (lo que no se pudo ver).
+- `estado`: `seguro_ya` (reversible y verificado), `firma` (necesita la decisión del dueño), `contradicho`,
+  `no_verificado` o `informativo` (por defecto). `prioridad`: 1 a 99, 1 = lo primero.
+- `alcance`: `nivel` (`organizacion`, `cuenta`, `region`, `recurso`), `cuenta`, `region` y `fingerprints` (los del
+  finding). Un insight con fingerprints sigue al problema entre corridas; uno de otra corrida se ve atenuado y no
+  cuenta en los totales.
+- **El dinero y los porcentajes no se escriben en `titulo` ni en `texto`.** Van como `{{c1}}` y `cifras.c1` dice de
+  dónde sale (`fuente`) y cómo se muestra (`formato`: `usd`, `pct`, `num`). Se rechaza el dinero escrito con símbolo
+  (`$12`, `12€`), con código (`12 USD`), en palabras (`11 dólares`, `once mil dólares`) y los porcentajes (`94%`,
+  `94 por ciento`). Fechas, cuentas, contadores y tipos de instancia sí pueden ir en el texto. Fuentes:
+  - `finding:<fingerprint>.monthly_usd`;
+  - `suma:<fp>,<fp>.monthly_usd` (sin fingerprints repetidos: contarían dos veces);
+  - `discovery:<ruta.punteada>` (un número de `discovery.json`);
+  - `evidencia:<E1>.<clave>`;
+  - `total:maximo_teorico`, `total:seguro_ya` o `total:gasto_informativo`.
+
+  El dashboard formatea el valor en el navegador (el dinero sigue el selector de moneda).
+- `evidencia`: `origen` `dive` (datos que ya trae la corrida) o `aws` (una consulta que la skill hizo). Una de
+  `aws` apunta con `salida_ref` a la salida cruda que guardó el runner en `aws/<id>.json` (con su hash), y sus
+  `valores` tienen que ser un valor (una hoja numérica) de esa salida, no un pedazo de otro número ni de una fecha. `salida_ref` es
+  `A###.json`. Con `salida_ref` y `valores` solo vale `origen: aws`. `evidencia[].comando` es descriptivo: sin `; | & $ ` < > \` ni saltos de línea.
+- `no_determinado`: lo que la skill no pudo saber y el operador debe comprobar. `pregunta_dueno`: la pregunta
+  concreta. `accion.comando`: lo ejecuta una persona, con un perfil con escritura; solo `aws --profile '<perfil-con-escritura>' [--region '…'] <servicio> <operación> --opción 'valor'…`,
+  con los valores entre comillas simples, una línea por comando (hasta 6): sin pipes, `;`, `&`, `$()` ni redirecciones. Los textos no llevan imágenes ni enlaces de Markdown.
+- `seguro_ya` solo vale para un hallazgo o recomendación cuyos fingerprints son ahorros que suman, con monto y de un
+  tipo reversible (`common/verificacion.py`). Los totales (`seguro_ya`, `maximo_teorico`, `por_reversibilidad`,
+  `gasto_informativo`) los calcula el script y los recalcula el dashboard; no hay un campo de totales. Un fingerprint no puede estar
+  en un insight `seguro_ya` y en otro `firma`, `contradicho` o `no_verificado`. Cada cifra declara un formato coherente con su fuente:
+  `finding`, `suma` y `total` son `usd`; `evidencia` nunca es `usd`.
+- Un archivo con cualquier problema no se publica, ni a medias: el script sale con error y el dashboard no muestra
+  ninguno de sus insights (el Resumen lista los problemas). El informe `informe-finops.md` lleva al final la marca `<!-- insights-sha256: … -->`:
+  el dashboard avisa si ya no corresponde al `insights.json` actual. No se leen archivos que sean symlinks o
+  hardlinks, ni `insights.json` de más de 2 MB.
+
+### aws/<id>.json (salidas del runner)
+
+`skill/scripts/aws_leer.py` es la única forma en que la skill consulta AWS. Solo ejecuta lecturas de metadatos,
+de una lista blanca de pares (servicio, operación) (nunca `describe_*` o `list_*` en general: Lambda, `describe_instance_attribute`,
+las versiones de launch templates, las task definitions de ECS o las suscripciones de SNS no están), siempre con el perfil de
+solo lectura de DIVE de esa cuenta (en `assume_role`, solo con el rol `DIVE_ReadOnly`), en una cuenta y región de la corrida, con
+parámetros JSON validados y sin shell. Antes de guardar, redacta `UserData`, `Environment`, `Variables`, `Input` y similares. Guarda `{id, cuenta, region, servicio, operacion,
+parametros, salida, truncada, sha256, ejecutado, username}`; `salida` es la respuesta cruda (hasta 200 KB) y
+`username` lista las personas que aparecen en ella (el anonimizador las reemplaza).
