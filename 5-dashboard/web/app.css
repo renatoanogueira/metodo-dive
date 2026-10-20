@@ -70,6 +70,25 @@ table.tabla{border-collapse:collapse;width:100%}
 .tag{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;border:1px solid var(--border);color:var(--text-secondary);margin-right:4px;white-space:nowrap}
 .tag.nuevo{border-color:var(--accent);color:var(--accent)}
 .tag.reaparece{border-color:var(--alta);color:var(--alta)}
+.tag.v-seguro_ya{border-color:var(--baja);color:var(--baja)}
+.tag.v-firma{border-color:var(--media);color:var(--media)}
+.tag.v-contradicho{border-color:var(--alta);color:var(--alta)}
+.verif.vieja{opacity:.75}
+.tag.v-informativo{border-color:var(--border);color:var(--text-secondary)}
+.tag.v-no_verificado{border-color:var(--media);color:var(--media)}
+.tag.v-vieja{border-color:var(--border);color:var(--text-secondary)}
+.insight{border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:10px 0}
+.insight.est-seguro_ya{border-left:4px solid var(--baja)}
+.insight.est-firma{border-left:4px solid var(--media)}
+.insight.est-contradicho{border-left:4px solid var(--alta)}
+.insight .cab{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.insight p{margin:8px 0}
+.indeterminado{margin:6px 0;padding:6px 8px;border-left:3px solid var(--media);background:var(--media-bg);font-size:13px}
+.pregunta{margin:6px 0;font-size:13px}
+.accion pre{white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 0}
+.aviso-insights{border:1px solid var(--alta);background:var(--alta-bg);border-radius:8px;padding:10px 14px;margin:10px 0}
+.verif{margin-top:4px;font-size:12px;color:var(--text-secondary)}
+pre.informe{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.45;margin:0}
 .detalle{color:var(--text-secondary);font-size:12px;margin-top:4px;overflow-wrap:anywhere}
 .estado select{min-height:30px;padding:2px 6px}
 .estado textarea{display:block;width:100%;min-height:52px;margin-top:6px;font-size:12px}
@@ -96,3 +115,7 @@ h2.grupo:first-child{margin-top:4px}
 .chips{display:flex;gap:8px;flex-wrap:wrap;padding:12px 12px 0}
 .chip{border:1px solid transparent;cursor:pointer;min-height:30px;padding:2px 12px;font-size:13px}
 .chip[aria-pressed="true"]{border-color:currentColor;box-shadow:0 0 0 1px currentColor}
+
+.enlace{background:none;border:0;padding:0;color:var(--accent,#2563eb);cursor:pointer;font:inherit;text-decoration:underline}
+.insight-detalle{margin-top:6px}
+.insight-detalle p{margin:6px 0}

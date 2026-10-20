@@ -11,8 +11,11 @@ Llamadas a Cost Explorer (cada una cuesta USD 0.01), sin importar cuántas cuent
   1 llamada   GroupBy LINKED_ACCOUNT + RECORD_TYPE de lo que no es uso (impuestos, Savings Plans, RIs, créditos)
   Total = 3 + 2R, más una llamada extra por cada página (NextPageToken). R suele ser 3-8.
   El número de cuentas solo influye en la paginación, no en el número de llamadas base.
+  Datos FinOps (finops.py, sin --sin-finops): hasta 5 llamadas más (utilización y cobertura de Savings Plans,
+  utilización de reservas, monitores y suscripciones de anomalías). Cost Optimization Hub, Savings Plans y la
+  factura (Invoicing) no son Cost Explorer y no cuestan.
 
-Uso: python 1-descubrir/descubrir.py [--config dive.config.yaml] [--meses 6]
+Uso: python 1-descubrir/descubrir.py [--config dive.config.yaml] [--meses 6] [--sin-finops]
 """
 
 import argparse
@@ -27,6 +30,7 @@ sys.path.insert(0, str(AQUI.parent))
 from common import (SERVICIOS_GOBIERNO, ahora, cargar_config, error_corto, escribir_json,  # noqa: E402
                     marcar_ultima, nueva_corrida, run_de)
 from common.aws import client, listar_cuentas, sesion_management  # noqa: E402
+from finops import recolectar as recolectar_finops  # noqa: E402
 
 # Solo cuenta el USO de recursos. Se dejan fuera impuestos, créditos y sobre todo las cuotas de
 # RIs / Savings Plans (Recurring, Upfront...): las paga la cuenta que compró la reserva aunque
@@ -287,10 +291,29 @@ def imprimir_resumen(discovery, llamadas, errores, top=10):
         print(f"  ⚠ región {e['region']!r}: {e['error']}")
 
 
+def imprimir_finops(f):
+    sp = f.get("savings_plans") or {}
+    u = sp.get("utilizacion") or {}
+    coh = f.get("hub_optimizacion") or {}
+    moneda = f.get("moneda_pago") or {}
+    partes = [f"{len(sp.get('activos') or [])} Savings Plans activos"
+              + (f" ({u['porcentaje']:.1f}% usados)" if u.get("porcentaje") is not None else ""),
+              f"anomalías: {len((f.get('anomalias') or {}).get('monitores') or [])} monitores",
+              f"Cost Optimization Hub: {coh.get('estado') or '—'} ({len(coh.get('recomendaciones') or [])} recomendaciones)",
+              f"moneda de pago: {moneda.get('codigo') or 'USD'}"
+              + (f" (1 USD = {moneda['tasa']:g}, {moneda.get('periodo') or moneda.get('fuente')})"
+                 if moneda.get("codigo") and moneda["codigo"] != "USD" else "")]
+    print("FinOps: " + " · ".join(partes))
+    for a in f.get("avisos") or []:
+        print(f"  aviso {a['seccion']}: {'sin permiso' if a['tipo'] == 'sin_permiso' else a['tipo']} — {a['error']}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config")
     parser.add_argument("--meses", type=int, help="Sobrescribe billing_months del config")
+    parser.add_argument("--sin-finops", action="store_true",
+                        help="No leer compromisos, anomalías, Cost Optimization Hub ni la moneda de la factura")
     args = parser.parse_args()
 
     cfg = cargar_config(args.config)
@@ -307,6 +330,9 @@ def main():
     carpeta = nueva_corrida(cfg)
     discovery = {"run": run_de(carpeta, org["Id"], org["MasterAccountId"], cfg, discovery.pop("currency")),
                  **discovery}
+    if not args.sin_finops:
+        discovery["finops"] = recolectar_finops(session, cuentas, org["MasterAccountId"], cfg)
+        imprimir_finops(discovery["finops"])
     ruta = escribir_json(carpeta / "discovery.json", discovery)
     marcar_ultima(carpeta)
     imprimir_resumen(discovery, llamadas, errores)

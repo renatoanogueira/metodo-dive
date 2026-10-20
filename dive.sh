@@ -5,6 +5,8 @@
 # Uso:
 #   bash dive.sh --config ~/clientes/acme/dive.config.yaml
 #   bash dive.sh --config ... --sin-doctor        # fase V sin aws-doctor
+#   bash dive.sh --config ... --sin-precios       # fase V sin la Price List API (precios estimados de us-east-1)
+#   bash dive.sh --config ... --sin-finops        # fase D sin Savings Plans, Cost Optimization Hub ni moneda
 #   bash dive.sh --config ... --sin-dashboard     # no abre el dashboard al final
 #   bash dive.sh --config ... --sin-navegador     # abre el dashboard pero solo imprime la URL
 #
@@ -17,9 +19,9 @@ RAIZ="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 export PYTHONUNBUFFERED=1   # la fase 1 va por tee: sin esto su salida aparece toda al final
 PY="$RAIZ/.venv/bin/python"
 CONFIG="${DIVE_CONFIG:-}"
-SIN_DOCTOR=false; SIN_DASHBOARD=false; SIN_NAVEGADOR=false
+SIN_DOCTOR=false; SIN_PRECIOS=false; SIN_FINOPS=false; SIN_DASHBOARD=false; SIN_NAVEGADOR=false
 
-ayuda() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+ayuda() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,6 +29,8 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 && "$2" != --* ]] || { echo "--config necesita una ruta (ver --help)" >&2; exit 2; }
       CONFIG="$2"; shift 2 ;;
     --sin-doctor) SIN_DOCTOR=true; shift ;;
+    --sin-precios) SIN_PRECIOS=true; shift ;;
+    --sin-finops) SIN_FINOPS=true; shift ;;
     --sin-dashboard) SIN_DASHBOARD=true; shift ;;
     --sin-navegador) SIN_NAVEGADOR=true; shift ;;
     -h|--help) ayuda; exit 0 ;;
@@ -171,7 +175,9 @@ fase() {  # fase <título> <script> [args...]
 SALIDA_F1="$(mktemp)"   # se borra en el trap de salida (y antes del exec del dashboard)
 paso "1/5 Descubrir (Cost Explorer)"
 INICIO=$SECONDS
-"$PY" "$RAIZ/1-descubrir/descubrir.py" | tee "$SALIDA_F1" || falla "Falló: 1/5 Descubrir. No se creó ninguna corrida completa."
+DESCUBRIR_ARGS=()
+$SIN_FINOPS && DESCUBRIR_ARGS+=(--sin-finops)
+"$PY" "$RAIZ/1-descubrir/descubrir.py" ${DESCUBRIR_ARGS[@]+"${DESCUBRIR_ARGS[@]}"} | tee "$SALIDA_F1" || falla "Falló: 1/5 Descubrir. No se creó ninguna corrida completa."
 echo "  ✓ 1/5 Descubrir ($((SECONDS - INICIO)) s)"
 CORRIDA="$(sed -n 's#^→ \(.*\)/discovery\.json$#\1#p' "$SALIDA_F1" | tail -n 1)"
 [[ -n "$CORRIDA" && -f "$CORRIDA/discovery.json" ]] || falla "No encuentro la carpeta de la corrida en la salida de la fase 1."
@@ -179,6 +185,7 @@ CORRIDA="$(sed -n 's#^→ \(.*\)/discovery\.json$#\1#p' "$SALIDA_F1" | tail -n 1
 fase "2/5 Inventariar" 2-inventariar/inventariar.py --discovery "$CORRIDA/discovery.json"
 VALIDAR_ARGS=(--inventory "$CORRIDA/inventory.json")
 $SIN_DOCTOR && VALIDAR_ARGS+=(--sin-doctor)
+$SIN_PRECIOS && VALIDAR_ARGS+=(--sin-precios)
 fase "3/5 Validar" 3-validar/validar.py "${VALIDAR_ARGS[@]}"
 fase "4/5 Esquematizar (diagramas)" 4-esquematizar/esquematizar.py --inventory "$CORRIDA/inventory.json"
 fase "5/5 Reporte" 4-esquematizar/reporte.py --inventory "$CORRIDA/inventory.json"
@@ -190,7 +197,7 @@ echo "  Para compartirla: $PY \"$RAIZ/anonimizar/anonimizar.py\" \"$CORRIDA\""
 # ---------- dashboard ----------
 
 if $SIN_DASHBOARD; then
-  echo "  Dashboard: $PY \"$RAIZ/5-dashboard/dashboard.py\""
+  echo "  Dashboard: $PY \"$RAIZ/5-dashboard/dashboard.py\" --config \"$CONFIG\""
   exit 0
 fi
 DASH_ARGS=()

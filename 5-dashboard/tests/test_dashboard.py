@@ -31,14 +31,15 @@ def _f(fp, titulo, source="regla", usd=10.0, cat="desperdicio", region="eu-west-
 
 
 def _corrida(base_dir, run_id, findings, sin_doctor=False, errores=None, skipped=None, alias="mi-org",
-             inv_errores=None, generado=None):
+             inv_errores=None, generado=None, finops=None):
     c = base_dir / run_id
     c.mkdir()
     run = {"run_id": run_id, "organization_id": ORG, "org_alias": alias, "currency": "USD",
            "flags": {"validar": {"sin_doctor": sin_doctor}}}
     (c / "findings.json").write_text(json.dumps({"run": run, "generated_at": generado or run_id, "findings": findings,
                                                  "errors": errores or []}))
-    (c / "discovery.json").write_text(json.dumps({"run": run, "charges_monthly_usd": {
+    (c / "discovery.json").write_text(json.dumps({"run": run, **({"finops": finops} if finops is not None else {}),
+                                                  "charges_monthly_usd": {
         "111122223333": {"Tax": {"2026-09": 25.0}, "SavingsPlanNegation": {"2026-09": -5.0}}},
         "accounts": {"111122223333": {
         "name": "Prod", "regions": {"eu-west-1": {
@@ -304,3 +305,341 @@ def test_factura_con_uso_sin_umbral_y_cuentas_solo_cargos(tmp_path):
     assert r["factura_ultimo_mes"] == 125.0 + 25.0 - 5.0 + 50.0 and r["gasto_ultimo_mes"] == 120.0
     assert "999900000000" in r["cuentas"] and "444455556666" in r["cuentas"] and r["n_cuentas"] == 3
     assert r["n_cuentas_con_costo"] == 1
+
+
+FINOPS_OK = {"savings_plans": {"activos": []}, "reservas": {"utilizacion": None}, "anomalias": {"monitores": []},
+             "hub_optimizacion": {"estado": "Active", "recomendaciones": []},
+             "moneda_pago": {"codigo": "EUR", "tasa": 0.878, "periodo": "2026-09", "fuente": "invoice", "por_entidad": []}}
+
+
+def test_finops_no_leido_no_resuelve_y_leido_si(tmp_path):
+    coh = _f("c" * 16, "COH", source="cost-optimization-hub")
+    sp = {**_f("s" * 16, "SP sin usar", source="finops"), "rule_id": "finops.savings_plans_sin_usar"}
+    _corrida(tmp_path, "2026-10-01T000000Z", [coh, sp], finops=FINOPS_OK)
+    _corrida(tmp_path, "2026-10-02T000000Z", [], finops=None)                                    # --sin-finops
+    _corrida(tmp_path, "2026-10-03T000000Z", [], finops={**FINOPS_OK, "hub_optimizacion": None})  # COH sin permiso
+    _corrida(tmp_path, "2026-10-04T000000Z", [], finops=FINOPS_OK)
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    for run, esperado in (("2026-10-02T000000Z", ("no_verificado", "no_verificado")),
+                          ("2026-10-03T000000Z", ("no_verificado", "resuelto")),
+                          ("2026-10-04T000000Z", ("resuelto", "resuelto"))):
+        h = _por_fp(base.hallazgos(con, ORG, run))
+        assert (h["c"]["presencia"], h["s"]["presencia"]) == esperado, run
+
+
+def test_moneda_de_la_corrida_en_el_resumen(tmp_path):
+    _corrida(tmp_path, "2026-10-01T000000Z", [], finops=FINOPS_OK)
+    _corrida(tmp_path, "2026-10-02T000000Z", [], finops={**FINOPS_OK, "moneda_pago": {"codigo": "EUR", "tasa": "x"}})
+    _corrida(tmp_path, "2026-10-03T000000Z", [])
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    m = base.resumen(con, ORG, "2026-10-01T000000Z")["run"]["moneda"]
+    assert (m["codigo"], m["tasa"], m["periodo"]) == ("EUR", 0.878, "2026-09")
+    assert base.resumen(con, ORG, "2026-10-02T000000Z")["run"]["moneda"] is None  # forma inválida: se ignora
+    assert base.resumen(con, ORG, "2026-10-03T000000Z")["run"]["moneda"] is None
+
+
+
+def test_sin_budget_no_se_resuelve_si_no_se_miro_la_management(tmp_path):
+    f = {**_f("g" * 16, "Cuenta sin AWS Budget", cat="riesgo"), "rule_id": "regla.sin_budget", "region": None}
+
+    def corrida(run_id, findings, escaneo_mgmt):
+        c = _corrida(tmp_path, run_id, findings)
+        inv = json.loads((c / "inventory.json").read_text())
+        inv["run"] = {**inv["run"], "management_account_id": "999999999999"}
+        inv["scanned"] = [{"account_id": "999999999999", "region": "us-east-1", "collector": "budgets"}] if escaneo_mgmt else []
+        (c / "inventory.json").write_text(json.dumps(inv))
+        for nombre in ("findings.json", "discovery.json"):
+            d = json.loads((c / nombre).read_text())
+            d["run"]["management_account_id"] = "999999999999"
+            (c / nombre).write_text(json.dumps(d))
+
+    corrida("2026-10-01T000000Z", [f], True)
+    corrida("2026-10-02T000000Z", [], False)   # la management no se pudo mirar
+    corrida("2026-10-03T000000Z", [], True)
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-02T000000Z"))["g"]["presencia"] == "no_verificado"
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-03T000000Z"))["g"]["presencia"] == "resuelto"
+
+
+def _ins(id_, fps, estado="firma", tipo="hallazgo", prioridad=1, texto="Texto del insight", **extra):
+    return {"id": id_, "tipo": tipo, "estado": estado, "prioridad": prioridad, "titulo": f"Título {id_}", "texto": texto,
+            "alcance": {"nivel": "recurso", "cuenta": "111122223333", "region": "eu-west-1", "fingerprints": fps}, **extra}
+
+
+def test_insights_de_la_skill_en_el_panel(tmp_path):
+    a = _f("a" * 16, "volumen suelto")
+    a.update(rule_id="regla.ebs_sin_adjuntar", issue_id="ebs.unattached")          # reversible, suma
+    b = _f("b" * 16, "eip", cat="desperdicio")
+    b.update(rule_id="regla.eip_sin_asociar", issue_id="eip.unassociated")         # irreversible
+    info = _f("c" * 16, "ipv4", cat="costo")
+    info["is_saving"] = False
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b, info])
+    _corrida(tmp_path, "2026-10-02T000000Z", [a, b, info])
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    r = base.resumen(con, ORG, "2026-10-01T000000Z")
+    assert r["ahorro_seguro_ya"] is None and r["insights"] == {"n": 0, "problemas": []}   # la skill aún no concluyó nada
+
+    def escribir(items, **extra):
+        (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": items, **extra}))
+        base.ingerir(con, [tmp_path])
+        return _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))
+
+    cifra = {"c1": {"fuente": "finding:" + "a" * 16 + ".monthly_usd", "formato": "usd"}}
+    # La skill escribe insights.json DESPUÉS: el panel lo toma sin reingerir la corrida. Un "totales" escrito a mano
+    # en el archivo no cuenta: el panel recalcula todo.
+    h = escribir([_ins("I01", ["a" * 16], "seguro_ya", texto="Cuesta {{c1}} al mes", cifras=cifra,
+                       evidencia=[{"id": "E1", "origen": "dive", "descripcion": "available y sin tags"}]),
+                  _ins("I02", ["b" * 16], "firma", prioridad=2, pregunta_dueno="¿allowlist?",
+                       no_determinado="No se sabe si la IP está en un DNS externo.")],
+                 totales={"seguro_ya": 999999})
+    assert h["a"]["insight"]["estado"] == "seguro_ya" and h["a"]["insight"]["vigente"]
+    assert h["a"]["insight"]["valores"] == {"c1": 10.0} and h["a"]["insight"]["cifras"]["c1"]["formato"] == "usd"
+    assert h["b"]["insight"]["pregunta_dueno"] == "¿allowlist?" and h["c"]["insight"] is None
+    r = base.resumen(con, ORG, "2026-10-01T000000Z")
+    assert r["ahorro_seguro_ya"] == 10.0 and r["insights"]["n"] == 2        # el monto sale del finding
+    datos = base.insights(con, ORG, "2026-10-01T000000Z")
+    assert datos["totales"]["seguro_ya"] == 10.0 and datos["totales"]["maximo_teorico"] == 20.0
+    assert [i["id"] for i in datos["insights"]] == ["I01", "I02"]            # por prioridad
+    assert base.insights(con, "o-otraorg123", "2026-10-01T000000Z") is None  # otra organización
+
+    # En la corrida siguiente se ve, con su fecha, pero no cuenta en "seguro ya": nadie lo re-analizó.
+    h2 = _por_fp(base.hallazgos(con, ORG, "2026-10-02T000000Z"))
+    assert h2["a"]["insight"]["corrida"] == "2026-10-01T000000Z" and not h2["a"]["insight"]["vigente"]
+    assert base.resumen(con, ORG, "2026-10-02T000000Z")["ahorro_seguro_ya"] is None
+
+    # Un archivo con cualquier ítem inválido no se muestra ni a medias, y el panel dice por qué.
+    for malo in (_ins("I03", ["b" * 16], "seguro_ya"),                                  # EIP: irreversible
+                 _ins("I03", ["c" * 16], "seguro_ya"),                                  # IPv4: no suma
+                 _ins("I03", ["f" * 16]),                                               # fingerprint ajeno
+                 _ins("I03", ["a" * 16], texto="Cuesta $10 al mes"),                    # dinero a mano
+                 _ins("I03", ["a" * 16], cifras={"c1": {"fuente": "total:inventado", "formato": "usd"}}, texto="{{c1}}")):
+        h = escribir([_ins("I01", ["a" * 16], "firma"), malo])
+        assert all(x["insight"] is None for x in h.values()), malo["texto"]
+        res = base.resumen(con, ORG, "2026-10-01T000000Z")["insights"]
+        assert res["n"] == 0 and res["problemas"], malo
+
+    # Si lo reescribe, se relee; si lo borra, se olvida.
+    h = escribir([_ins("I01", ["a" * 16], "contradicho", texto="Tiene tráfico")])
+    assert h["a"]["insight"]["estado"] == "contradicho"
+    (c1 / "insights.json").unlink()
+    base.ingerir(con, [tmp_path])
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))["a"]["insight"] is None
+    assert base.resumen(con, ORG, "2026-10-01T000000Z")["insights"] == {"n": 0, "problemas": []}
+
+
+def test_evidencia_aws_del_runner_se_valida_en_el_panel(tmp_path):
+    import hashlib
+    a = _f("a" * 16, "volumen")
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a])
+    salida = "RequestCount: 0"
+    (c1 / "aws").mkdir()
+    (c1 / "aws" / "A001.json").write_text(json.dumps({"id": "A001", "salida": salida,
+                                                      "sha256": hashlib.sha256(salida.encode()).hexdigest()}))
+    con = base.conectar(tmp_path / "db.sqlite")
+
+    def con_valor(v):
+        ev = [{"id": "E1", "origen": "aws", "descripcion": "tráfico", "salida_ref": "A001.json", "valores": {"requests": v}}]
+        (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": [
+            _ins("I01", ["a" * 16], evidencia=ev, texto="Tuvo {{c1}} requests",
+                 cifras={"c1": {"fuente": "evidencia:E1.requests", "formato": "num"}})]}))
+        base.ingerir(con, [tmp_path])
+        return base.resumen(con, ORG, "2026-10-01T000000Z")["insights"]
+    assert con_valor(0)["n"] == 1
+    assert con_valor(64100)["n"] == 0                               # el valor no está en la salida guardada
+    (c1 / "aws" / "A001.json").write_text(json.dumps({"id": "A001", "salida": salida + " 64100", "sha256": "x" * 64}))
+    assert con_valor(64100)["n"] == 0                               # salida modificada: no coincide con su hash
+
+
+def test_no_sigue_symlinks_ni_hardlinks(tmp_path):
+    import os
+    secreto = tmp_path / "fuera" / "credentials"
+    secreto.parent.mkdir()
+    secreto.write_text("SECRETO")
+    corridas = tmp_path / "runs"
+    corridas.mkdir()
+    c = _corrida(corridas, "2026-10-01T000000Z", [_f("a" * 16, "x")])
+    (c / "informe-finops.md").symlink_to(secreto)
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [corridas])
+    assert base.informe(con, ORG, "2026-10-01T000000Z") is None
+    assert not base.resumen(con, ORG, "2026-10-01T000000Z")["tiene_informe"]
+    (c / "informe-finops.md").unlink()
+    os.link(secreto, c / "informe-finops.md")                                     # hardlink: tampoco
+    assert base.informe(con, ORG, "2026-10-01T000000Z") is None
+    # Una carpeta de corrida que es un symlink no se ingiere.
+    otra = tmp_path / "fuera" / "2026-10-02T000000Z"
+    _corrida(tmp_path / "fuera", "2026-10-02T000000Z", [_f("b" * 16, "y")])
+    (corridas / "2026-10-02T000000Z").symlink_to(otra)
+    base.ingerir(con, [corridas])
+    assert "2026-10-02T000000Z" not in [r[0] for r in con.execute("SELECT run_id FROM runs")]
+
+
+def test_servidor_informe_con_token_y_como_json(servidor, tmp_path):
+    p = servidor
+    (tmp_path / "2026-10-03T000000Z" / "informe-finops.md").write_text("# Informe\n<script>alert(1)</script>")
+    ruta = f"/api/informe?org={ORG}&run=2026-10-03T000000Z"
+    assert _pedir(p, "GET", ruta)[0] == 403                                            # sin token
+    estado, headers, cuerpo = _pedir(p, "GET", ruta, {"X-DIVE-Token": "TOKEN123"})
+    assert estado == 200 and headers["Content-Type"].startswith("application/json")
+    assert json.loads(cuerpo)["texto"].startswith("# Informe")                      # el panel usa textContent
+    assert _pedir(p, "GET", f"/api/informe?org={ORG}&run=../../etc", {"X-DIVE-Token": "TOKEN123"})[0] == 404
+    assert _pedir(p, "GET", f"/api/informe?org={ORG}&run=2026-10-01T000000Z", {"X-DIVE-Token": "TOKEN123"})[0] == 404
+
+
+def test_fifo_json_patologico_y_carpeta_cambiada_por_link(tmp_path):
+    import os
+    corridas = tmp_path / "runs"
+    corridas.mkdir()
+    c = _corrida(corridas, "2026-10-01T000000Z", [_f("a" * 16, "x")])
+    os.mkfifo(c / "insights.json")                           # un FIFO no bloquea la ingesta
+    os.mkfifo(c / "informe-finops.md")
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [corridas])
+    assert not base.resumen(con, ORG, "2026-10-01T000000Z")["tiene_informe"]
+    (c / "insights.json").unlink()
+    (c / "insights.json").write_text("[" * 200000)           # RecursionError: no tumba el panel, y dice que es inválido
+    base.ingerir(con, [corridas])
+    assert _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))["a"]["insight"] is None
+    assert base.resumen(con, ORG, "2026-10-01T000000Z")["insights"]["problemas"]
+    # La carpeta de la corrida se cambia por un link después de la ingesta: el panel no sigue el link.
+    (c / "informe-finops.md").unlink()
+    afuera = tmp_path / "afuera"
+    afuera.mkdir()
+    (afuera / "informe-finops.md").write_text("PLANTADO")
+    c.rename(tmp_path / "movida")
+    c.symlink_to(afuera)
+    assert base.informe(con, ORG, "2026-10-01T000000Z") is None
+
+
+def test_lectura_rechaza_archivo_que_cambia_y_nombres_con_ruta(tmp_path, monkeypatch):
+    import os
+    from common import verificacion as v
+    (tmp_path / "a.json").write_text("0123456789")
+    assert v.leer_en_carpeta(tmp_path, "a.json", 100) == b"0123456789"
+    assert v.leer_en_carpeta(tmp_path, "../" + tmp_path.name + "/a.json", 100) is None
+    assert v.leer_en_carpeta(tmp_path, str(tmp_path / "a.json"), 100) is None
+    assert v.existe_en_carpeta(tmp_path, "a.json", 100) and not v.existe_en_carpeta(tmp_path, "a.json", 5)
+    real = os.fstat
+
+    class St:  # el archivo "creció" entre fstat y la lectura
+        def __init__(self, st):
+            self.st_mode, self.st_nlink, self.st_size = st.st_mode, st.st_nlink, st.st_size - 5
+    monkeypatch.setattr(v.os, "fstat", lambda fd: St(real(fd)))
+    assert v.leer_en_carpeta(tmp_path, "a.json", 100) is None
+
+
+def test_findings_con_entero_gigante_no_tumba_la_ingesta(tmp_path):
+    malo = _corrida(tmp_path, "2026-10-01T000000Z", [_f("a" * 16, "x")])
+    (malo / "findings.json").write_text((malo / "findings.json").read_text().replace('"monthly_usd": 10.0',
+                                                                                     '"monthly_usd": 1e999'))
+    _corrida(tmp_path, "2026-10-02T000000Z", [_f("b" * 16, "y")])
+    con = base.conectar(tmp_path / "db.sqlite")
+    nuevas, _ = base.ingerir(con, [tmp_path])
+    assert nuevas == ["2026-10-02T000000Z"]          # la rota se omite; las demás entran igual
+
+
+def test_servidor_insights_con_token(servidor, tmp_path):
+    p = servidor
+    ruta = f"/api/insights?org={ORG}&run=2026-10-03T000000Z"
+    assert _pedir(p, "GET", ruta)[0] == 403                                            # sin token
+    estado, headers, cuerpo = _pedir(p, "GET", ruta, {"X-DIVE-Token": "TOKEN123"})
+    assert estado == 200 and headers["Content-Type"].startswith("application/json")
+    datos = json.loads(cuerpo)
+    assert datos["insights"] == [] and set(datos["totales"]) >= {"seguro_ya", "maximo_teorico"}
+    assert _pedir(p, "GET", f"/api/insights?org={ORG}&run=../../etc", {"X-DIVE-Token": "TOKEN123"})[0] == 404
+    assert _pedir(p, "GET", f"/api/insights?org=o-otraorg123&run=2026-10-03T000000Z", {"X-DIVE-Token": "TOKEN123"})[0] == 404
+
+
+def test_prioridades_del_resumen(tmp_path):
+    a = _f("a" * 16, "volumen suelto")
+    a.update(rule_id="regla.ebs_sin_adjuntar", issue_id="ebs.unattached")
+    b = _f("b" * 16, "otro")
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b])
+    (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": [
+        _ins("I01", ["a" * 16], "seguro_ya", prioridad=1),
+        {"id": "I02", "tipo": "causa_costo", "prioridad": 2, "alcance": {"nivel": "organizacion"},
+         "titulo": "Causa", "texto": "Texto"},
+        _ins("I03", ["b" * 16], "firma", prioridad=3),
+        {"id": "I04", "tipo": "laguna", "prioridad": 4, "alcance": {"nivel": "organizacion"}, "titulo": "Laguna", "texto": "Texto"},
+        _ins("I05", ["b" * 16], "firma", prioridad=5)]}))
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    r = base.resumen(con, ORG, "2026-10-01T000000Z")
+    assert [i["id"] for i in r["prioridades"]] == ["I01", "I02", "I03"]            # por prioridad, sin lagunas, solo 3
+    assert [i["id"] for i in base.resumen(con, ORG, "2026-10-01T000000Z", "111122223333")["prioridades"]] == ["I01", "I02", "I03"]
+    assert [i["id"] for i in base.resumen(con, ORG, "2026-10-01T000000Z", "444455556666")["prioridades"]] == ["I02"]  # solo la org
+
+
+def test_insights_respetan_el_filtro_de_cuenta(tmp_path):
+    a = _f("a" * 16, "de la cuenta 1")
+    b = {**_f("b" * 16, "de la cuenta 2", usd=5.0), "account_id": "444455556666"}
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b])
+    ins = [_ins("I01", ["a" * 16]), {**_ins("I02", ["b" * 16]), "alcance": {"nivel": "recurso", "cuenta": "444455556666", "fingerprints": ["b" * 16]}},
+           {**_ins("I03", ["a" * 16, "b" * 16]), "alcance": {"nivel": "organizacion", "fingerprints": ["a" * 16, "b" * 16]}},
+           {**_ins("I04", []), "alcance": {"nivel": "organizacion"}, "tipo": "recomendacion"}]
+    (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": ins}))
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    run = "2026-10-01T000000Z"
+    todos = base.insights(con, ORG, run)
+    assert [i["id"] for i in todos["insights"]] == ["I01", "I02", "I03", "I04"] and todos["totales"]["maximo_teorico"] == 15.0
+    uno = base.insights(con, ORG, run, "111122223333")
+    assert [i["id"] for i in uno["insights"]] == ["I01", "I03", "I04"]        # sin el de la otra cuenta; el de la org se queda
+    assert uno["totales"]["maximo_teorico"] == 10.0                           # los totales también son de la cuenta
+    assert {i["id"]: i["n_cuentas"] for i in uno["insights"]} == {"I01": 1, "I03": 2, "I04": 0}
+    assert [i["id"] for i in base.insights(con, ORG, run, "777788889999")["insights"]] == ["I04"]
+
+
+def test_resumen_trae_lo_que_no_cuelga_de_un_hallazgo(tmp_path):
+    a = _f("a" * 16, "algo")
+    b = {**_f("b" * 16, "de otra cuenta"), "account_id": "444455556666"}
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b])
+    laguna = {**_ins("I09", []), "tipo": "laguna", "estado": "informativo", "alcance": {"nivel": "organizacion"}}
+    otra = {**_ins("I08", []), "alcance": {"nivel": "cuenta", "cuenta": "444455556666"}}
+    (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": [_ins("I01", ["a" * 16]), laguna, otra]}))
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    run = "2026-10-01T000000Z"
+    assert [i["id"] for i in base.resumen(con, ORG, run)["aparte"]] == ["I08", "I09"]       # sin hallazgo: van en Resumen
+    assert [i["id"] for i in base.resumen(con, ORG, run, "111122223333")["aparte"]] == ["I09"]  # la de otra cuenta, fuera
+
+
+def test_en_una_fila_gana_el_insight_que_cambia_la_decision_no_el_mas_general(tmp_path):
+    a = _f("a" * 16, "volumen")
+    a.update(rule_id="regla.ebs_sin_adjuntar", issue_id="ebs.unattached")
+    b = _f("b" * 16, "otro")
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a, b])
+    general = {**_ins("I01", ["a" * 16, "b" * 16], "informativo", tipo="causa_costo", prioridad=1),
+               "alcance": {"nivel": "organizacion", "fingerprints": ["a" * 16, "b" * 16]}}
+    firma = _ins("I02", ["a" * 16], "firma", prioridad=5)
+    solo_info = {**_ins("I03", ["b" * 16], "informativo", tipo="causa_costo", prioridad=2)}   # lo tapa I01 en su única fila
+    (c1 / "insights.json").write_text(json.dumps({"run_id": "2026-10-01T000000Z", "insights": [general, firma, solo_info]}))
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    h = _por_fp(base.hallazgos(con, ORG, "2026-10-01T000000Z"))
+    assert h["a"]["insight"]["id"] == "I02"                       # firma (prio 5) gana al informativo general (prio 1)
+    assert h["b"]["insight"]["id"] == "I01"                       # entre dos informativos, la prioridad
+    # I03 no gana en ninguna fila: no se pierde, pasa a "aparte" del Resumen.
+    assert [i["id"] for i in base.resumen(con, ORG, "2026-10-01T000000Z")["aparte"]] == ["I03"]
+
+
+def test_el_informe_solo_vale_si_sale_del_insights_json_actual(tmp_path):
+    import hashlib
+    a = _f("a" * 16, "algo")
+    c1 = _corrida(tmp_path, "2026-10-01T000000Z", [a])
+    contenido = json.dumps({"run_id": "2026-10-01T000000Z", "insights": [_ins("I01", ["a" * 16])]})
+    (c1 / "insights.json").write_text(contenido)
+    con = base.conectar(tmp_path / "db.sqlite")
+    base.ingerir(con, [tmp_path])
+    run = "2026-10-01T000000Z"
+    sha = hashlib.sha256(contenido.encode()).hexdigest()
+    assert base.informe_actual(con, run, f"# Informe\n<!-- insights-sha256: {sha} -->\n")
+    assert not base.informe_actual(con, run, "# Informe sin marca")
+    assert not base.informe_actual(con, run, f"# Informe\n<!-- insights-sha256: {'0' * 64} -->\n")
+    (c1 / "insights.json").write_text(contenido.replace("Texto del insight", "Otro texto"))   # se edita después
+    base.ingerir(con, [tmp_path])
+    assert not base.informe_actual(con, run, f"# Informe\n<!-- insights-sha256: {sha} -->\n")

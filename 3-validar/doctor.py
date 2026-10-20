@@ -37,7 +37,7 @@ CATEGORIAS = {
     "reserved_instances": dict(titulo="Reserved Instance por vencer o vencida", cat="costo", sev="media",
                                id=["reserved_instance_id"], costo=[]),
     "unused_load_balancers": dict(titulo="Load balancer sin targets", cat="desperdicio", sev="media",
-                                  id=["name", "arn"], costo=["estimated_monthly_cost"]),
+                                  id=["arn", "name"], costo=["estimated_monthly_cost"]),
     "unused_amis": dict(titulo="AMI sin uso (verificar ASG/launch templates)", cat="desperdicio", sev="baja",
                         id=["image_id"], costo=["max_potential_saving_monthly"]),
     "orphaned_snapshots": dict(titulo="Snapshot EBS huérfano (volumen borrado)", cat="desperdicio", sev="baja",
@@ -53,7 +53,8 @@ CATEGORIAS = {
                                                          costo=[], agrupar=True, global_=True),
     "cloudwatch_log_groups_without_retention_policy": dict(titulo="Log groups sin retención", cat="costo",
                                                            sev="baja", id=["log_group_name"],
-                                                           costo=["estimated_monthly_cost"], agrupar=True),
+                                                           costo=["estimated_monthly_cost"], agrupar=True,
+                                                           informativo=True),
     "stopped_rds_instances": dict(titulo="Instancia RDS detenida", cat="desperdicio", sev="media",
                                   id=["db_instance_id"], costo=["estimated_monthly_cost"]),
     "old_rds_snapshots": dict(titulo="Snapshot manual RDS viejo", cat="desperdicio", sev="baja",
@@ -62,7 +63,7 @@ CATEGORIAS = {
                                id=["db_instance_id"], costo=["estimated_monthly_cost"]),
     # Categorías de aws-doctor 2.x (claves de model/output_json.go, v2.21.1).
     "idle_load_balancers": dict(titulo="Load balancer sin tráfico", cat="desperdicio", sev="media",
-                                id=["name", "arn"], costo=["estimated_monthly_cost"]),
+                                id=["arn", "name"], costo=["estimated_monthly_cost"]),
     "idle_nat_gateways": dict(titulo="NAT Gateway sin tráfico", cat="desperdicio", sev="media",
                               id=["nat_gateway_id"], costo=["estimated_monthly_cost"]),
     "idle_ec2_instances": dict(titulo="Instancia EC2 ociosa (CPU y red bajas)", cat="desperdicio", sev="media",
@@ -301,7 +302,7 @@ def items_a_findings(items_por_cuenta_region):
             usd = it["usd"]
             findings.append(hallazgo(conf["cat"], severidad_por_costo(usd, conf["sev"]), account_id, reg, it["id"],
                                      conf["titulo"], it["info"] or conf["titulo"], usd, FUENTE,
-                                     rule_id=f"{FUENTE}.{it['clave']}"))
+                                     rule_id=f"{FUENTE}.{it['clave']}", ahorro=not conf.get("informativo")))
 
     for (account_id, reg, clave), grupo in agrupados.items():
         conf = CATEGORIAS[clave]
@@ -312,7 +313,7 @@ def items_a_findings(items_por_cuenta_region):
         findings.append(hallazgo(conf["cat"], severidad_por_costo(usd, conf["sev"]), account_id, reg, None,
                                  f"{conf['titulo']} ({len(ids)})",
                                  f"{len(ids)} recursos: " + ", ".join(ids[:MAX_EJEMPLOS]) + extra, usd, FUENTE,
-                                 rule_id=f"{FUENTE}.{clave}"))
+                                 rule_id=f"{FUENTE}.{clave}", ahorro=not conf.get("informativo")))
     return findings
 
 

@@ -17,8 +17,11 @@ y `source` (aws-doctor | cruce-billing | regla).
    contexto de negocio que no estén ahí. Si algo no se puede concluir con los datos, dilo así: "no hay datos para…".
 2. Cada afirmación cita al menos un `id` de finding (ej. `F012`) y, cuando exista, el `resource_id` y el `account_id`.
 3. No inventes cifras. Los montos salen de `monthly_usd`; si es `null`, escribe "sin estimado". Al sumar, di qué IDs sumaste.
-4. `monthly_usd` es un **estimado** (precios de us-east-1, o promedio mensual del billing). Algunos findings se solapan
+4. `monthly_usd` es un **estimado**: mira `price_source` (`pricing_api` = precio on-demand de la región,
+   `static_estimate` = precio de us-east-1, `ce_actual` = promedio mensual del billing) y `confidence`. Algunos findings se solapan
    (ej. un volumen gp2 sin adjuntar aparece como desperdicio y como migración a gp3): no los sumes dos veces.
+   Solo suma ahorro de los findings con `is_saving: true`. Con `is_saving: false` el monto es **gasto actual**
+   (IPv4 públicas, almacenamiento de logs sin retención): sirve para priorizar, no es dinero que se recupera.
 5. Un finding `cruce-billing` de "se cobra pero no está inventariado" puede ser un hueco del inventario (colector que
    falló o no cubre ese recurso), no necesariamente un recurso olvidado. Lee el `detail` antes de clasificarlo.
 6. No recomiendes borrar nada sin verificación previa. Para cada acción, indica qué hay que comprobar antes.
@@ -31,7 +34,8 @@ con más findings de severidad alta.
 
 ### 2. Quick wins
 Acciones de bajo riesgo y poco esfuerzo con ahorro claro: desperdicio evidente (volúmenes sin adjuntar, EIPs sin
-asociar, snapshots viejos, gp2→gp3, log groups sin retención). Tabla:
+asociar, snapshots viejos, gp2→gp3, load balancers sin targets). Los log groups sin retención y las IPv4 públicas
+van aparte como gasto a revisar, sin sumarlos al ahorro. Tabla:
 
 | Prioridad | IDs | Cuenta | Acción | Verificar antes | $/mes |
 

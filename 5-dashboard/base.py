@@ -4,10 +4,18 @@ Las corridas son de solo lectura; lo único que el usuario edita es `estado` (ac
 guarda por organización + fingerprint y sobrevive a cualquier corrida nueva. Sin dependencias: sqlite3.
 """
 
+import hashlib
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+
+from common import moneda_de_pago
+from common import insights as contrato
+from common.verificacion import cargar_json, existe_en_carpeta, leer_archivo_seguro, leer_en_carpeta
+
+MAX_JSON_CORRIDA = 500_000_000  # bytes: inventory.json de una organización grande
 
 ESTADOS = ("abierto", "aceptado", "ignorado", "resuelto")
 MAX_NOTA = 2000
@@ -15,7 +23,8 @@ MAX_NOTA = 2000
 ESQUEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY, org_id TEXT NOT NULL, org_alias TEXT, carpeta TEXT NOT NULL,
-    generated_at TEXT, currency TEXT, sin_doctor INTEGER, dive_version TEXT, n_errores INTEGER
+    generated_at TEXT, currency TEXT, sin_doctor INTEGER, dive_version TEXT, n_errores INTEGER,
+    moneda TEXT  -- JSON de discovery.finops.moneda_pago: moneda de la factura y tasa USD → moneda
 );
 CREATE TABLE IF NOT EXISTS cuentas (run_id TEXT, account_id TEXT, name TEXT, PRIMARY KEY (run_id, account_id));
 CREATE TABLE IF NOT EXISTS costos (run_id TEXT, account_id TEXT, region TEXT, service TEXT, month TEXT, usd REAL);
@@ -38,14 +47,22 @@ CREATE TABLE IF NOT EXISTS estado (
     org_id TEXT, fingerprint TEXT, status TEXT NOT NULL, nota TEXT, updated_at TEXT,
     PRIMARY KEY (org_id, fingerprint)
 );
+-- insights.json de la skill metodo-dive, validado y con las cifras resueltas desde sus fuentes. `firma` = hash del
+-- archivo: se relee si cambia aunque la corrida ya estuviera ingerida. Si es inválido no se guarda ningún insight y
+-- `problemas` dice por qué (el panel lo muestra).
+CREATE TABLE IF NOT EXISTS insights (run_id TEXT, id TEXT, orden INTEGER, doc TEXT, PRIMARY KEY (run_id, id));
+CREATE TABLE IF NOT EXISTS insight_fp (run_id TEXT, fingerprint TEXT, insight_id TEXT,
+                                       PRIMARY KEY (run_id, fingerprint, insight_id));
+CREATE TABLE IF NOT EXISTS insights_archivo (run_id TEXT PRIMARY KEY, firma TEXT, problemas TEXT);
 CREATE INDEX IF NOT EXISTS i_findings_fp ON findings (fingerprint);
 CREATE INDEX IF NOT EXISTS i_costos_run ON costos (run_id);
 CREATE INDEX IF NOT EXISTS i_usos_run ON usos (run_id);
 """
 
 
-VERSION_ESQUEMA = 4  # 2: recursos; 3: cargos; 4: uso_total. Al subirla, las corridas se reingieren (el estado
-TABLAS_CORRIDA = ("runs", "cuentas", "costos", "usos", "findings", "sin_verificar", "recursos", "cargos", "uso_total")
+VERSION_ESQUEMA = 7  # 2: recursos; 3: cargos; 4: uso_total; 5: moneda; 6: verificaciones; 7: insights. Al subirla, las corridas se reingieren (el estado
+TABLAS_CORRIDA = ("runs", "cuentas", "costos", "usos", "findings", "sin_verificar", "recursos", "cargos", "uso_total",
+                  "insights", "insight_fp", "insights_archivo")
 # del usuario, tabla estado, se conserva).
 
 
@@ -66,9 +83,11 @@ def conectar(ruta):
 
 
 def _leer(ruta):
+    """JSON de un archivo de la corrida, sin seguir symlinks ni aceptar NaN o anidamientos patológicos."""
+    crudo = leer_archivo_seguro(ruta, MAX_JSON_CORRIDA)
     try:
-        return json.loads(Path(ruta).read_text())
-    except (OSError, ValueError):
+        return cargar_json(crudo) if crudo is not None else None
+    except ValueError:
         return None
 
 
@@ -78,7 +97,9 @@ def ingerir(con, carpetas_base):
     ya = {r[0]: r[1] for r in con.execute("SELECT run_id, generated_at FROM runs")}
     nuevas, omitidas = [], []
     for base in carpetas_base:
-        for carpeta in sorted(p for p in Path(base).iterdir() if p.is_dir() and not p.name.endswith("-anon")):
+        # Un symlink no es una corrida: la carpeta tiene que estar dentro de output_dir (lo que se sirve sale de ahí).
+        for carpeta in sorted(p for p in Path(base).iterdir()
+                              if p.is_dir() and not p.is_symlink() and not p.name.endswith("-anon")):
             findings = _leer(carpeta / "findings.json")
             if findings is None:
                 continue
@@ -92,6 +113,7 @@ def ingerir(con, carpetas_base):
                 omitidas.append(f"{carpeta.name} (mismo run_id que otra organización)")
                 continue
             if rid in ya and ya[rid] == findings.get("generated_at"):
+                _ingerir_insights(con, carpeta, rid)  # la skill puede haberlos escrito después
                 continue
             # Nueva, o re-validada (otro generated_at, ej. validar con aws-doctor tras un --sin-doctor): se rehace
             # entera. El estado del usuario no se toca: va por fingerprint.
@@ -102,19 +124,88 @@ def ingerir(con, carpetas_base):
                 _ingerir_corrida(con, carpeta, run, findings, _dict(_leer(carpeta / "discovery.json")),
                                  _dict(_leer(carpeta / "inventory.json")))
                 con.execute("RELEASE corrida")
-            except (AttributeError, TypeError, KeyError, ValueError, sqlite3.Error):
+            except (AttributeError, TypeError, KeyError, ValueError, OverflowError, sqlite3.Error):
                 con.execute("ROLLBACK TO corrida")
                 con.execute("RELEASE corrida")
                 omitidas.append(carpeta.name)
                 continue
             ya[rid] = findings.get("generated_at")
             nuevas.append(rid)
+            _ingerir_insights(con, carpeta, rid)
     con.commit()
     return nuevas, omitidas
 
 
 def _dict(x):
     return x if isinstance(x, dict) else {}
+
+
+def _ingerir_insights(con, carpeta, rid):
+    """insights.json de la skill, si cambió desde la última vez. Se valida con las reglas del contrato
+    (common/insights.py) contra los findings, discovery.json y las salidas de aws/ de esta corrida, y las cifras
+    se resuelven desde sus fuentes aquí: el panel nunca confía en un total ni un monto escrito en el archivo.
+    Un archivo con cualquier problema no se muestra (se guardan los problemas). No sigue symlinks."""
+    try:
+        crudo = leer_en_carpeta(carpeta, "insights.json", contrato.MAX_ARCHIVO) or b""
+        firma = hashlib.sha256(crudo).hexdigest() if crudo else None
+        previa = con.execute("SELECT firma FROM insights_archivo WHERE run_id = ?", (rid,)).fetchone()
+        if (previa[0] if previa else None) == firma:
+            return
+        for t in ("insights", "insight_fp", "insights_archivo"):
+            con.execute(f"DELETE FROM {t} WHERE run_id = ?", (rid,))
+        if firma:
+            problemas = []
+            try:
+                datos = cargar_json(crudo)
+            except ValueError as e:
+                datos, problemas = None, [f"insights.json no es JSON válido ({e})"]
+            if datos is not None:
+                validos, problemas = contrato.revisar(datos, rid, _contexto_insights(con, carpeta, rid))
+                if not problemas:
+                    for orden, ins in enumerate(sorted(validos, key=lambda i: (i["prioridad"], i["id"]))):
+                        con.execute("INSERT INTO insights VALUES (?,?,?,?)",
+                                    (rid, ins["id"], orden, json.dumps(ins, ensure_ascii=False)))
+                        for fp in (ins.get("alcance") or {}).get("fingerprints") or []:
+                            con.execute("INSERT OR IGNORE INTO insight_fp VALUES (?,?,?)", (rid, fp, ins["id"]))
+            con.execute("INSERT INTO insights_archivo VALUES (?,?,?)", (rid, firma, json.dumps(problemas[:30])))
+        con.commit()
+    except sqlite3.Error:
+        con.rollback()  # base ocupada: se reintenta en la próxima recarga
+
+
+def _findings_de(con, rid):
+    return {r["fingerprint"]: dict(r) for r in con.execute(
+        """SELECT fingerprint, id, category, account_id, region, resource_id, monthly_usd, rule_id, issue_id, is_saving
+           FROM findings WHERE run_id = ?""", (rid,))}
+
+
+def _contexto_insights(con, carpeta, rid):
+    findings = _findings_de(con, rid)
+    discovery = _dict(_leer(Path(carpeta) / "discovery.json"))
+    cuentas = set(_dict(discovery.get("accounts"))) | {f["account_id"] for f in findings.values() if f["account_id"]}
+
+    def aws(ref):
+        crudo = leer_en_carpeta(Path(carpeta) / "aws", ref, 1_000_000)
+        try:
+            return cargar_json(crudo) if crudo is not None else None
+        except ValueError:
+            return None
+    return {"findings": findings, "discovery": discovery, "cuentas": cuentas, "aws": aws}
+
+
+SECCIONES_FINOPS = ("savings_plans", "reservas", "anomalias", "hub_optimizacion")
+# Sección de discovery.finops de la que sale cada finding de la fuente "finops" (por rule_id).
+SECCION_REGLA_FINOPS = {"finops.savings_plans_sin_usar": "savings_plans", "finops.savings_plan_vence": "savings_plans",
+                        "finops.cobertura_baja": "savings_plans", "finops.reservas_sin_usar": "reservas",
+                        "finops.sin_anomalias": "anomalias", "finops.anomalias_sin_suscripcion": "anomalias",
+                        "finops.coh_inactivo": "hub_optimizacion"}
+
+
+def _seccion_finops(f):
+    if f["source"] == "cost-optimization-hub":
+        return "hub_optimizacion"
+    return SECCION_REGLA_FINOPS.get(f.get("rule_id")) if f["source"] == "finops" else None
+
 
 
 def _ingerir_corrida(con, carpeta, run, findings, discovery, inventory):
@@ -124,9 +215,18 @@ def _ingerir_corrida(con, carpeta, run, findings, discovery, inventory):
     # aws-doctor no instalado o sin perfiles: un error sin cuenta. Para la historia es igual que --sin-doctor.
     sin_doctor = bool(validar.get("sin_doctor")) or any(
         e.get("collector") == "aws-doctor" and not e.get("account_id") for e in errores)
-    con.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?)",
+    finops = discovery.get("finops")
+    moneda = moneda_de_pago(discovery)  # None si falta, es USD o tiene forma inválida
+    con.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (rid, run["organization_id"], run.get("org_alias"), str(carpeta), findings.get("generated_at"),
-                 run.get("currency"), int(sin_doctor), run.get("dive_version"), len(errores)))
+                 run.get("currency"), int(sin_doctor), run.get("dive_version"), len(errores),
+                 json.dumps(moneda) if moneda else None))
+    # Secciones FinOps que esta corrida no leyó (--sin-finops, sin permiso, error): sus findings no se pueden
+    # dar por resueltos si faltan.
+    no_leidas = list(SECCIONES_FINOPS) if not isinstance(finops, dict) else [s for s in SECCIONES_FINOPS
+                                                                             if finops.get(s) is None]
+    con.executemany("INSERT INTO sin_verificar VALUES (?,?,?,?)",
+                    [(rid, "*finops", None, f"finops:{s}") for s in no_leidas])
     # Todas las cuentas que aparecen: con costo (discovery), solo inventario o solo cargos (ej. la que paga el SP).
     nombres = {a: (d or {}).get("name") for a, d in _dict(inventory.get("accounts")).items()}
     nombres.update({a: (d or {}).get("name") for a, d in _dict(discovery.get("accounts")).items()})
@@ -181,6 +281,13 @@ def _ingerir_corrida(con, carpeta, run, findings, discovery, inventory):
         if isinstance(s, dict):
             con.execute("INSERT INTO sin_verificar VALUES (?,?,?,?)",
                         (rid, s.get("account_id"), s.get("region"), "región no habilitada"))
+    # Sin budgets de la management (colector caído, cuenta excluida o corrida anterior al colector), la regla
+    # "cuenta sin budget" no afirma nada: que falte no es que se resolvió.
+    mgmt = run.get("management_account_id")
+    escaneo_ok = {(s.get("account_id"), s.get("collector")) for s in inventory.get("scanned") or [] if isinstance(s, dict)}
+    fallos = {(e.get("account_id"), e.get("collector")) for e in inventory.get("errors") or [] if isinstance(e, dict)}
+    if (mgmt, "budgets") not in escaneo_ok or (mgmt, "budgets") in fallos:
+        con.execute("INSERT INTO sin_verificar VALUES (?,?,?,?)", (rid, "*budgets", None, "budgets:management"))
     # Fallos del inventario: sin acceso a la cuenta (todo), o un colector caído en una cuenta × región.
     for e in inventory.get("errors") or []:
         if not isinstance(e, dict) or not e.get("account_id"):
@@ -244,7 +351,16 @@ def _verificable(sin_verif, sin_doctor, f):
     doctor = f["source"] == "aws-doctor"
     if doctor and sin_doctor:
         return False
+    seccion = _seccion_finops(f)
     for acc, reg, motivo in sin_verif:
+        if acc == "*finops":
+            if seccion and motivo == f"finops:{seccion}":
+                return False
+            continue
+        if acc == "*budgets":
+            if f.get("rule_id") == "regla.sin_budget":
+                return False
+            continue
         if acc == "*":  # Cost Explorer falló en la región: el cruce billing ↔ inventario no pudo verla
             if f["source"] == "cruce-billing" and _misma_region(reg, f["region"]):
                 return False
@@ -286,6 +402,17 @@ def hallazgos(con, org_id, run_id):
                                 ON f.fingerprint = u.fingerprint AND f.run_id = u.m""", previas):
         ultimos[fila["fingerprint"]] = dict(fila)
 
+    # El insight más reciente de cada fingerprint hasta esta corrida (el de una corrida anterior sigue valiendo, con
+    # su fecha, mientras el finding exista); en una misma corrida, el que más importa para esa fila (ver RANGO_ESTADO).
+    ins, mejor = {}, {}
+    for fila in con.execute(f"""SELECT f.fingerprint, i.run_id, i.orden, i.doc,
+                                       COALESCE(json_extract(i.doc, '$.estado'), 'informativo') AS estado
+                                FROM insight_fp f JOIN insights i ON i.run_id = f.run_id AND i.id = f.insight_id
+                                WHERE f.run_id IN ({marcas})""", previas):
+        clave = (fila["run_id"], -RANGO_ESTADO.get(fila["estado"], 4), -fila["orden"])
+        if fila["fingerprint"] not in mejor or clave > mejor[fila["fingerprint"]]:
+            mejor[fila["fingerprint"]] = clave
+            ins[fila["fingerprint"]] = (fila["run_id"], fila["doc"])
     actuales = {f["fingerprint"]: dict(f) for f in con.execute("SELECT * FROM findings WHERE run_id = ?", (run_id,))}
     salida = []
     for fp, f in actuales.items():
@@ -309,6 +436,10 @@ def hallazgos(con, org_id, run_id):
                  nuevo=f["presencia"] == "presente" and h["primera"] == run_id and len(previas) > 1,
                  estado=e.get("status") or "abierto", nota=e.get("nota") or "", estado_fecha=e.get("updated_at"))
         f["reaparece"] = f["presencia"] == "presente" and f["estado"] == "resuelto"
+        v = ins.get(f["fingerprint"])
+        # vigente: concluido en esta corrida. Uno de una corrida anterior se muestra con su fecha, pero no cuenta en
+        # "ahorro seguro ya": el recurso pudo cambiar desde entonces.
+        f["insight"] = {**json.loads(v[1]), "corrida": v[0], "vigente": v[0] == run_id} if v else None
     orden = {"alta": 0, "media": 1, "baja": 2}
     salida.sort(key=lambda f: (f["presencia"] != "presente", orden.get(f["severity"], 9), -(f["monthly_usd"] or 0)))
     return salida
@@ -372,7 +503,7 @@ def resumen(con, org_id, run_id, cuenta=None):
                     "uso": uso_ventana, "factura": round(uso_fact_ventana + cargos_ventana, 2),
                     "impuestos": impuestos_ventana},
         "uso_total_mes": total_mes,
-        "run": dict(run),
+        "run": {**dict(run), "moneda": json.loads(run["moneda"]) if run["moneda"] else None},
         "cuenta": cuenta,
         "tiene_cargos": bool(con.execute("SELECT 1 FROM cargos WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()),
         "cargos": cargos,
@@ -393,6 +524,17 @@ def resumen(con, org_id, run_id, cuenta=None):
         # Resueltos en ESTA corrida (simétrico con "nuevos"); los de antes siguen en la lista con su fecha.
         "resueltos": sum(1 for f in lista if f["presencia"] == "resuelto" and f.get("resuelto_en") == run_id),
         "no_verificados": sum(1 for f in lista if f["presencia"] == "no_verificado"),
+        # De lo abierto, lo que un insight de ESTA corrida marca como reversible y seguro (None si la skill no
+        # concluyó nada en ella). El monto sale del finding, nunca del insight.
+        "ahorro_seguro_ya": (round(sum(f["monthly_usd"] or 0 for f in abiertos if f["is_saving"]
+                                       and (f.get("insight") or {}).get("estado") == "seguro_ya"
+                                       and f["insight"]["vigente"]), 2)
+                             if any((f.get("insight") or {}).get("vigente") and f["presencia"] == "presente"
+                                    for f in lista) else None),
+        "insights": insights_de_la_corrida(con, run_id),
+        "prioridades": _prioridades(con, run_id, cuenta),
+        "aparte": _aparte(con, run_id, cuenta),
+        "tiene_informe": bool(run["carpeta"]) and existe_en_carpeta(run["carpeta"], "informe-finops.md", MAX_INFORME),
         "por_cuenta_mes": por_cuenta_mes,
         "servicios": servicios,
         "usos": usos,
@@ -416,8 +558,11 @@ def recursos(con, org_id, run_id, cuenta=None):
         for k in ("tags", "attrs", "relations"):
             d[k] = json.loads(d[k] or "{}")
         # Los findings de recursos globales (S3, IAM, CloudFront) van con region None; el recurso, con "global".
-        d["n_hallazgos"] = (con_hallazgos.get((d["account_id"], d["region"], d["id"]), 0) +
-                            (con_hallazgos.get((d["account_id"], None, d["id"]), 0) if d["region"] == "global" else 0))
+        # Un finding puede citar el recurso por su ARN (classic LB: el id es el nombre).
+        ids = {d["id"], d.get("arn")} - {None}
+        d["n_hallazgos"] = sum(con_hallazgos.get((d["account_id"], d["region"], i), 0) +
+                               (con_hallazgos.get((d["account_id"], None, i), 0) if d["region"] == "global" else 0)
+                               for i in ids)
         salida.append(d)
     return salida
 
@@ -438,6 +583,101 @@ def guardar_estado(con, org_id, fingerprint, status, nota):
                 (org_id, fingerprint, status, nota, ahora))
     con.commit()
     return {"org_id": org_id, "fingerprint": fingerprint, "status": status, "nota": nota, "updated_at": ahora}
+
+
+MAX_INFORME = 1_000_000  # bytes
+
+
+def insights_de_la_corrida(con, run_id):
+    """{"n", "problemas"} del insights.json de la corrida (n = 0 si no hay o es inválido)."""
+    n = con.execute("SELECT COUNT(*) FROM insights WHERE run_id = ?", (run_id,)).fetchone()[0]
+    fila = con.execute("SELECT problemas FROM insights_archivo WHERE run_id = ?", (run_id,)).fetchone()
+    return {"n": n, "problemas": json.loads(fila[0]) if fila else []}
+
+
+# Qué insight se muestra en una fila que varios cubren: el que cambia lo que hay que hacer con ella. Un informativo
+# general (prioridad 1, 50 recursos) no tapa al "firma" o "seguro ya" de un recurso concreto.
+RANGO_ESTADO = {"contradicho": 0, "firma": 1, "no_verificado": 2, "seguro_ya": 3, "informativo": 4}
+
+
+def _docs_de_la_cuenta(docs, findings, cuenta):
+    """Los insights de esa cuenta (por su alcance o por los findings que cubren) y los de toda la organización
+    (sin cuenta ni fingerprints)."""
+    propios = {fp for fp, f in findings.items() if f["account_id"] == cuenta}
+
+    def de_la_cuenta(d):
+        a = d.get("alcance") or {}
+        fps = set(a.get("fingerprints") or [])
+        return a.get("cuenta") == cuenta or bool(fps & propios) or (not a.get("cuenta") and not fps)
+    return [d for d in docs if de_la_cuenta(d)]
+
+
+def _prioridades(con, run_id, cuenta=None, n=3):
+    """Los n insights de mayor prioridad (sin las lagunas), para la pestaña Resumen. Con filtro de cuenta: los de esa
+    cuenta (por alcance o por sus findings) y los de toda la organización."""
+    docs = [json.loads(r[0]) for r in con.execute("SELECT doc FROM insights WHERE run_id = ? ORDER BY orden", (run_id,))]
+    if cuenta:
+        docs = _docs_de_la_cuenta(docs, _findings_de(con, run_id), cuenta)
+    return [d for d in docs if d["tipo"] != "laguna"][:n]
+
+
+def _aparte(con, run_id, cuenta=None):
+    """Insights que no se ven en ninguna fila de Hallazgos: los que no cuelgan de ningún hallazgo (lagunas, avisos de
+    toda la organización) y los que otro insight tapa en todas sus filas. Van en la pestaña Resumen. Con filtro de
+    cuenta, los de esa cuenta y los de toda la organización."""
+    ganan = {}
+    for fp, iid, orden, estado in con.execute(
+            """SELECT f.fingerprint, f.insight_id, i.orden, COALESCE(json_extract(i.doc, '$.estado'), 'informativo')
+               FROM insight_fp f JOIN insights i ON i.run_id = f.run_id AND i.id = f.insight_id
+               WHERE f.run_id = ?""", (run_id,)):
+        clave = (RANGO_ESTADO.get(estado, 4), orden)
+        if fp not in ganan or clave < ganan[fp][0]:
+            ganan[fp] = (clave, iid)
+    visibles = {v[1] for v in ganan.values()}
+    docs = [json.loads(r[0]) for r in con.execute("SELECT doc FROM insights WHERE run_id = ? ORDER BY orden", (run_id,))]
+    docs = [d for d in docs if d["id"] not in visibles]
+    if cuenta:
+        docs = [d for d in docs if (d.get("alcance") or {}).get("cuenta") in (None, cuenta)]
+    return docs
+
+
+def insights(con, org_id, run_id, cuenta=None):
+    """Insights de una corrida de esta organización, con los totales RECALCULADOS aquí desde los findings (nunca
+    leídos de un archivo). Con `cuenta`: solo los de esa cuenta y los de toda la organización, y los totales de
+    esa cuenta; cada insight trae `n_cuentas` (cuántas cuentas abarca: su monto es el de todas). None si la corrida
+    no existe."""
+    if not con.execute("SELECT 1 FROM runs WHERE run_id = ? AND org_id = ?", (run_id, org_id)).fetchone():
+        return None
+    docs = [json.loads(r[0]) for r in con.execute("SELECT doc FROM insights WHERE run_id = ? ORDER BY orden", (run_id,))]
+    findings = _findings_de(con, run_id)
+    for d in docs:
+        d["n_cuentas"] = len({findings[fp]["account_id"] for fp in (d.get("alcance") or {}).get("fingerprints") or []
+                              if fp in findings})
+    if cuenta:
+        docs = _docs_de_la_cuenta(docs, findings, cuenta)
+        findings = {fp: f for fp, f in findings.items() if f["account_id"] == cuenta}
+    return {"insights": docs, "problemas": insights_de_la_corrida(con, run_id)["problemas"],
+            "totales": contrato.totales(findings, docs)}
+
+
+def informe(con, org_id, run_id):
+    """Texto de informe-finops.md de una corrida de esta organización, o None. La carpeta sale de la base (nunca
+    de la URL) y el texto se muestra como texto plano en el panel: no se interpreta como HTML."""
+    fila = con.execute("SELECT carpeta FROM runs WHERE run_id = ? AND org_id = ?", (run_id, org_id)).fetchone()
+    if not fila or not fila[0]:
+        return None
+    crudo = leer_en_carpeta(fila[0], "informe-finops.md", MAX_INFORME)  # sin symlinks (ni en la carpeta) ni hardlinks
+    return crudo.decode("utf-8", errors="replace") if crudo is not None else None
+
+
+RE_MARCA_INFORME = re.compile(r"<!-- insights-sha256: ([0-9a-f]{64}) -->")
+
+
+def informe_actual(con, run_id, texto):
+    """¿El informe sale del insights.json que el panel muestra? Falso si se editó después o si no trae la marca."""
+    fila = con.execute("SELECT firma FROM insights_archivo WHERE run_id = ?", (run_id,)).fetchone()
+    m = RE_MARCA_INFORME.search(texto or "")
+    return bool(m and fila and fila[0] == m.group(1))
 
 
 def carpeta_de(con, run_id):

@@ -3,17 +3,20 @@
 Lee discovery.json + inventory.json de la carpeta de salida y escribe ahí mismo
 findings.json (forma de CONTRATO.md) y findings.md (resumen ordenado por severidad y $).
 
-Tres fuentes:
-  a) aws-doctor  → doctor.py  (salida cruda en salida/<corrida>/aws-doctor/)
-  b) cruce-billing → este archivo: lo que se cobra y no está inventariado, servicios sin
+Fuentes:
+  a) cost-optimization-hub y finops → hallazgos_finops.py (de discovery["finops"]: recomendaciones de
+     Cost Optimization Hub, compromisos sin usar o por vencer, anomalías)
+  b) aws-doctor  → doctor.py  (salida cruda en salida/<corrida>/aws-doctor/)
+  c) cruce-billing → este archivo: lo que se cobra y no está inventariado, servicios sin
      colector y regiones sorpresa
-  c) regla       → reglas.py  (desperdicio y riesgo sobre los recursos inventariados)
+  d) regla       → reglas.py  (desperdicio y riesgo sobre los recursos inventariados)
 
 Uso: python 3-validar/validar.py [--inventory salida/<corrida>/inventory.json] [--discovery ...]
-                                 [--sin-doctor] [--timeout-doctor 900]
+                                 [--sin-doctor] [--timeout-doctor 900] [--sin-precios]
 """
 
 import argparse
+import html
 import importlib
 import pkgutil
 import sys
@@ -25,9 +28,12 @@ sys.path.insert(0, str(RAIZ))
 sys.path.insert(0, str(RAIZ / "2-inventariar"))
 sys.path.insert(0, str(AQUI))
 
-from common import SERVICIOS_GOBIERNO, ahora, cargar_config, corrida_actual, escribir_json, heredar_run, leer_json  # noqa: E402
+from common import (SERVICIOS_GOBIERNO, _base_salida, ahora, cargar_config, corrida_actual, error_corto,  # noqa: E402
+                    escribir_json, heredar_run, leer_json, moneda_de_pago)
 
+import amis  # noqa: E402
 import doctor  # noqa: E402
+import hallazgos_finops  # noqa: E402
 import reglas  # noqa: E402
 from hallazgos import SEVERIDADES, completar_v2, hallazgo, severidad_por_costo  # noqa: E402
 
@@ -200,33 +206,48 @@ def _no_inventariado(account_id, region, servicio, usd_mes, mods_s, escaneado, e
 
 # ---------- consolidar y escribir ----------
 
+# Con el mismo problema detectado por dos fuentes, queda el de precio más confiable (las reglas con precio de
+# la Price List API citan el precio y quedan en precios.json; aws-doctor no dice de dónde sale el suyo).
+PRIORIDAD_PRECIO = {"ce_actual": 0, "cost_optimization_hub": 1, "pricing_api": 2, "aws_doctor": 3,
+                    "static_estimate": 4, None: 5}
+
+
 def deduplicar(findings):
     """Un finding por fingerprint (mismo problema canónico sobre el mismo recurso): si aws-doctor y una
-    regla detectan lo mismo, queda el primero. Dos problemas distintos del mismo recurso (RDS público y
-    sin cifrar) se mantienen los dos.
+    regla detectan lo mismo, queda el de mejor fuente de precio (PRIORIDAD_PRECIO) y, a igual fuente, el
+    primero. Dos problemas distintos del mismo recurso (RDS público y sin cifrar) se mantienen los dos.
 
     Además, un recurso suma ahorro una sola vez: si ya tiene un finding de desperdicio (ej. volumen sin
-    adjuntar), se descarta su costo (migrar gp2→gp3); y entre varios de ahorro del mismo recurso con
-    issue_ids distintos (snapshot huérfano de aws-doctor y viejo de la regla) queda el primero.
+    adjuntar), su costo (migrar gp2→gp3) se mantiene pero con is_saving=False; y entre varios de ahorro del
+    mismo recurso con issue_ids distintos cuenta el primero. No se descarta ninguno: así el conjunto de
+    fingerprints no depende de si corrió aws-doctor (un "idle" suyo no borra el "generación anterior" de una regla).
     """
-    vistos, con_ahorro, salida = set(), set(), []
     findings = [completar_v2(f) for f in findings]
-    # Primero los de desperdicio: si el mismo recurso trae un "costo", el que se conserva es el desperdicio.
-    orden = sorted(range(len(findings)), key=lambda i: (findings[i]["category"] != "desperdicio", i))
-    elegidos = set()
+    # 1) Por fingerprint, el de mejor fuente de precio. Solo elige entre detecciones del MISMO problema: el
+    #    paso 2 no mira la fuente, así qué problema sobrevive en un recurso no depende de si la API respondió.
+    mejor, primero = {}, {}
+    for i, f in enumerate(findings):
+        primero.setdefault(f["fingerprint"], i)
+        j = mejor.get(f["fingerprint"])
+        if j is None or PRIORIDAD_PRECIO.get(f["price_source"], 5) < PRIORIDAD_PRECIO.get(findings[j]["price_source"], 5):
+            mejor[f["fingerprint"]] = i
+    # 2) Primero los de desperdicio: si el mismo recurso trae un "costo", el que se conserva es el desperdicio.
+    orden = sorted(mejor.values(), key=lambda i: (findings[i]["category"] != "desperdicio",
+                                                  primero[findings[i]["fingerprint"]]))
+    con_ahorro = set()
     for i in orden:
         f = findings[i]
         recurso = (f["account_id"], f["region"], f["resource_id"])
-        if f["fingerprint"] in vistos:
-            continue
-        if f["resource_id"] and f["is_saving"]:
+        # Compiten los que traen monto (uno sin $ no puede contar dos veces) y los desperdicios aunque no
+        # traigan monto: un recurso que sobra no suma además su optimización.
+        if f["resource_id"] and f["is_saving"] and (f["monthly_usd"] is not None or f["category"] == "desperdicio"):
             if recurso in con_ahorro:
-                continue
-            con_ahorro.add(recurso)
-        vistos.add(f["fingerprint"])
-        elegidos.add(i)
-    salida = [f for i, f in enumerate(findings) if i in elegidos]
-    return salida
+                f["is_saving"] = False
+                f["detail"] = f"{f['detail']} No suma al ahorro: el recurso ya cuenta en otro hallazgo."
+            else:
+                con_ahorro.add(recurso)
+    elegidos = set(mejor.values())
+    return [f for i, f in enumerate(findings) if i in elegidos]
 
 
 def ordenar_y_numerar(findings):
@@ -239,7 +260,18 @@ def ordenar_y_numerar(findings):
 
 
 def _celda(texto):
-    return str(texto if texto is not None else "—").replace("|", "\\|").replace("\n", " ")
+    # Nombres y tags vienen de la cuenta auditada: se escapa HTML por si el visor de Markdown lo renderiza.
+    return html.escape(str(texto if texto is not None else "—"), quote=False).replace("|", "\\|").replace("\n", " ")
+
+
+def _en_moneda(discovery):
+    """Solo la tasa, sin el monto convertido: el anonimizador redondea montos en USD, no en otras monedas, y
+    con el monto exacto y la tasa se recuperaría el total exacto."""
+    m = moneda_de_pago(discovery)
+    if not m:
+        return ""
+    origen = f"factura de {m['periodo']}" if m["fuente"] == "invoice" else "config"
+    return f" (se paga en {m['codigo']}: tasa {m['tasa']:g} {m['codigo']} por dólar, {origen})"
 
 
 def generar_md(findings, discovery, errores):
@@ -249,12 +281,13 @@ def generar_md(findings, discovery, errores):
 
     lineas = ["# Findings · Método DIVE", "",
               f"Generado: {ahora()} · {len(findings)} findings · {len(discovery['accounts'])} cuentas", "",
-              f"Ahorro potencial estimado (desperdicio + costo): **${total:,.2f}/mes**. "
+              f"Ahorro potencial estimado (desperdicio + costo): **${total:,.2f}/mes**{_en_moneda(discovery)}. "
               "Es un tope: son estimaciones, y un recurso marcado como desperdicio no suma además su optimización.", "",
-              "| Severidad | Findings | $/mes |", "|---|---:|---:|"]
+              "| Severidad | Findings | Ahorro $/mes |", "|---|---:|---:|"]
     for sev in SEVERIDADES:
         grupo = [f for f in findings if f["severity"] == sev]
-        lineas.append(f"| {sev} | {len(grupo)} | ${sum(f['monthly_usd'] or 0 for f in grupo):,.2f} |")
+        ahorro = sum(f["monthly_usd"] or 0 for f in grupo if f.get("is_saving"))
+        lineas.append(f"| {sev} | {len(grupo)} | ${ahorro:,.2f} |")
 
     fuentes = {}
     for f in findings:
@@ -270,6 +303,8 @@ def generar_md(findings, discovery, errores):
                    "|---|---|---|---|---|---|---:|---|"]
         for f in grupo:
             usd = f"${f['monthly_usd']:,.2f}" if f["monthly_usd"] is not None else "—"
+            if f["monthly_usd"] is not None and not f.get("is_saving") and f["category"] in ("costo", "desperdicio"):
+                usd += " (no suma)"  # gasto informativo o ya contado en otro hallazgo del recurso
             lineas.append(f"| {f['id']} | {f['category']} | {_celda(cuenta(f['account_id']))} | {_celda(f['region'])} | "
                           f"{_celda(f['resource_id'])} | {_celda(f['title'])} | {usd} | {f['source']} |")
         lineas.append("")
@@ -286,11 +321,47 @@ def generar_md(findings, discovery, errores):
     return "\n".join(lineas)
 
 
-def validar(cfg, discovery, inventory, salida, sin_doctor=False, timeout_doctor=900):
-    """Corre las tres fuentes y escribe findings.json + findings.md en `salida`."""
+def precios_de_la_corrida(cfg, inventory, salida):
+    """Pide a la Price List API los precios que van a usar las reglas. Cache del día en <output_dir>/.precios/
+    (los precios cambian poco y la API es lenta). Nunca aborta la fase: sin sesión, red o acceso, devuelve el
+    error y las reglas usan su precio de respaldo.
+    → (precios, errores, cobertura): "pricing_api", "parcial", "static_estimate" o "n/a" (nada que cotizar)."""
+    pedidos = reglas.precios_necesarios(inventory)
+    if not pedidos:
+        return {}, [], "n/a"
+    try:
+        from common.aws import sesion_management
+        from common.precios import obtener_precios
+        base = _base_salida(cfg) if cfg.get("output_dir") else Path(salida).parent
+        precios, errores = obtener_precios(sesion_management(cfg), pedidos, base / ".precios" / "cache.json")
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — SystemExit: faltan los perfiles dive-* (common.aws)
+        return {}, [{"region": None, "collector": "precios", "error": error_corto(e)}], "static_estimate"
+    pedidas = sum(len(c) for c in pedidos.values())
+    obtenidas = sum(len(c) for c in precios.values())
+    cobertura = "static_estimate" if not obtenidas else "pricing_api" if obtenidas >= pedidas else "parcial"
+    return precios, errores, cobertura
+
+
+def validar(cfg, discovery, inventory, salida, sin_doctor=False, timeout_doctor=900, consultar_precios=False,
+            precios=None, lector_amis=None):
+    """Corre las tres fuentes y escribe findings.json + findings.md en `salida`. Con `consultar_precios`
+    pide los precios a la Price List API; `precios` permite pasarlos ya resueltos (tests)."""
     salida = Path(salida)
     findings, errores = [], []
     heredar_run(inventory, cfg, "validar", {})  # aborta antes de aws-doctor si la corrida es de otra organización
+
+    cobertura = "pricing_api" if precios else "static_estimate"
+    if consultar_precios:
+        precios, e_precios, cobertura = precios_de_la_corrida(cfg, inventory, salida)
+        errores += e_precios
+        if precios:
+            print(f"precios: {sum(len(v) for v in precios.values())} de la Price List API "
+                  f"({', '.join(sorted(precios))}) → {salida / 'precios.json'}")
+        elif cobertura != "n/a":
+            print("precios: sin Price List API; las reglas usan precios estimados de us-east-1")
+    # Siempre se reescribe: uno de una validación anterior de la misma corrida no debe quedar junto a
+    # findings que no lo usaron.
+    escribir_json(salida / "precios.json", {"generated_at": ahora(), "cobertura": cobertura, "precios": precios or {}})
 
     if sin_doctor:
         print("aws-doctor: omitido (--sin-doctor)")
@@ -304,16 +375,21 @@ def validar(cfg, discovery, inventory, salida, sin_doctor=False, timeout_doctor=
                        if c.get("enabled_regions")}
         f_doc, e_doc = doctor.ejecutar(cfg, discovery, salida, timeout=timeout_doctor, creds_fn=creds_fn,
                                        habilitadas=habilitadas)
-        findings += f_doc
+        # Las AMIs "sin uso" se confirman con su último lanzamiento (aws-doctor no lo mira).
+        findings += amis.refinar(cfg, f_doc, errores, lector=lector_amis)
         errores += e_doc
 
+    # Cost Optimization Hub primero: en el dedup, su monto (neto de compromisos) es el que cuenta para el recurso.
+    findings = hallazgos_finops.hallazgos(discovery, inventory) + hallazgos_finops.ajustar_por_compromisos(findings, discovery)
     findings += cruce_billing(discovery, inventory, cargar_colectores())
-    findings += reglas.aplicar(inventory)
+    findings += reglas.aplicar(inventory, precios)
+    findings = amis.marcar_aws_backup(findings, inventory)
     findings = ordenar_y_numerar(deduplicar(findings))
 
     # "errors" es adicional al contrato: corridas de aws-doctor que fallaron.
     run = heredar_run(inventory, cfg, "validar", {"sin_doctor": sin_doctor,
-                                                  "aws_doctor_version": None if sin_doctor else doctor.version()})
+                                                  "aws_doctor_version": None if sin_doctor else doctor.version(),
+                                                  "precios": cobertura})
     escribir_json(salida / "findings.json", {"run": run, "generated_at": ahora(), "findings": findings,
                                              "errors": errores})
     (salida / "findings.md").write_text(generar_md(findings, discovery, errores))
@@ -327,13 +403,15 @@ def main():
     parser.add_argument("--discovery", help="Ruta a discovery.json (por defecto, junto a inventory.json)")
     parser.add_argument("--sin-doctor", action="store_true", help="No ejecutar aws-doctor")
     parser.add_argument("--timeout-doctor", type=int, default=900, help="Segundos máximos por corrida de aws-doctor")
+    parser.add_argument("--sin-precios", action="store_true",
+                        help="No consultar la Price List API: las reglas usan precios estimados de us-east-1")
     args = parser.parse_args()
 
     cfg = cargar_config(args.config)
     ruta_inv = Path(args.inventory) if args.inventory else corrida_actual(cfg) / "inventory.json"
     ruta_disc = Path(args.discovery) if args.discovery else ruta_inv.parent / "discovery.json"
     findings, errores = validar(cfg, leer_json(ruta_disc), leer_json(ruta_inv), ruta_inv.parent,
-                                args.sin_doctor, args.timeout_doctor)
+                                args.sin_doctor, args.timeout_doctor, consultar_precios=not args.sin_precios)
 
     conteo = {s: sum(1 for f in findings if f["severity"] == s) for s in SEVERIDADES}
     print(f"→ {ruta_inv.parent / 'findings.json'}: {len(findings)} findings "

@@ -193,3 +193,102 @@ def test_org_alias_de_la_corrida_se_trata_como_marca(tmp_path):
 def test_run_id_se_conserva():
     a = an.Anonimizador(an.Mapeo(), ["acme"], "rounded")
     assert a.json({"run": {"run_id": "2026-10-18T073802Z"}})["run"]["run_id"] == "2026-10-18T073802Z"
+
+
+@pytest.mark.parametrize("costos", ["rounded", "percent"])
+def test_precio_unitario_de_las_reglas_se_oculta(costos):
+    a = an.Anonimizador(an.Mapeo(), ["acme"], costos, total_usd=1000.0, meses=1)
+    t = a.texto("100 GiB gp2 → gp3 sin downtime: 0.11 → 0.088 USD/GB-mes (Price List API). "
+                "precio 0.005 USD/hora (Price List API) × 730 h.")
+    assert "0.088" not in t and "0.11" not in t and "0.005" not in t
+    assert "USD/GB-mes de lista" in t and "USD/hora de lista" in t
+
+
+def test_precio_unitario_intacto_con_costos_exactos():
+    a = an.Anonimizador(an.Mapeo(), ["acme"], "exact")
+    assert "0.11 → 0.088 USD/GB-mes" in a.texto("0.11 → 0.088 USD/GB-mes")
+
+
+def test_no_copia_ni_sigue_symlinks(tmp_path):
+    """Un archivo de la corrida que es un symlink (ej. a ~/.aws/credentials) no se lee ni se copia a -anon."""
+    import subprocess
+    secreto = tmp_path / "credentials"
+    secreto.write_text("aws_secret_access_key = SECRETO123")
+    c = tmp_path / "salida" / "2026-10-18T000000Z"
+    c.mkdir(parents=True)
+    (c / "findings.json").write_text(json.dumps({"findings": []}))
+    (c / "informe-finops.md").symlink_to(secreto)
+    raiz = Path(__file__).resolve().parents[2]
+    r = subprocess.run([sys.executable, "-I", str(raiz / "anonimizar" / "anonimizar.py"), "--termino", "acme", str(c)],
+                       capture_output=True, text=True)
+    assert "es un symlink" in r.stderr
+    anon = tmp_path / "salida" / "2026-10-18T000000Z-anon"
+    assert not (anon / "informe-finops.md").exists()
+    assert all("SECRETO123" not in p.read_text() for p in anon.rglob("*") if p.is_file())
+
+
+def test_no_copia_hardlinks_ni_escribe_el_mapeo_por_un_link(tmp_path):
+    import os
+    import subprocess
+    secreto = tmp_path / "credentials"
+    secreto.write_text("aws_secret_access_key = SECRETO123")
+    c = tmp_path / "salida" / "2026-10-18T000000Z"
+    c.mkdir(parents=True)
+    (c / "findings.json").write_text(json.dumps({"findings": []}))
+    os.link(secreto, c / "notas.txt")                                    # hardlink: mismo inodo que el secreto
+    raiz = Path(__file__).resolve().parents[2]
+    cmd = [sys.executable, "-I", str(raiz / "anonimizar" / "anonimizar.py"), "--termino", "acme", str(c)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    assert "notas.txt no se copia" in r.stderr
+    anon = tmp_path / "salida" / "2026-10-18T000000Z-anon"
+    assert all("SECRETO123" not in p.read_text() for p in anon.rglob("*") if p.is_file())
+    assert oct((c / "anon.mapping.json").stat().st_mode & 0o777) == "0o600"
+    # Un mapeo que es un symlink (ej. a un archivo fuera de la corrida) no se usa ni se sobrescribe.
+    (c / "anon.mapping.json").unlink()
+    fuera = tmp_path / "fuera.json"
+    (c / "anon.mapping.json").symlink_to(fuera)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    assert r.returncode != 0 and "symlink" in (r.stdout + r.stderr) and not fuera.exists()
+
+
+def test_fechas_y_run_id_en_texto_no_son_tokens():
+    """Un run_id o una fecha ISO en un texto (ej. el título de informe-finops.md) no se toman por un ID de
+    recurso: si no, el run_id que los JSON conservan tal cual falla la verificación como "valor original"."""
+    a = an.Anonimizador(an.Mapeo(), ["acme"], "rounded")
+    t = "# Informe · corrida 2026-10-18T194232Z, generado 2026-10-18T20:10:00Z (2026-10-18)"
+    assert a.texto(t) == t
+    assert "token" not in {c for c, v in a.mp.m.items() if v} - {"term"}
+    # Un nombre compuesto de verdad sigue anonimizándose.
+    assert "qeNTEC75Ilgj" not in a.texto("Stack-Fn-qeNTEC75Ilgj")
+
+
+def test_run_id_dentro_de_un_nombre_y_diagrama_en_mayusculas(tmp_path):
+    import subprocess
+    import zlib
+    import base64
+    import urllib.parse
+    c = tmp_path / "salida" / "2026-10-18T194232Z"
+    (c / "diagramas").mkdir(parents=True)
+    (c / "findings.json").write_text(json.dumps({"run": {"run_id": "2026-10-18T194232Z"}, "findings": []}))
+    (c / "informe-finops.md").write_text("# Informe 2026-10-18T194232Z\nComparte salida/2026-10-18T194232Z-anon\n")
+    xml = '<mxGraphModel><root><mxCell value="acme-payroll 123456789012 vol-0abc123def4567890"/></root></mxGraphModel>'
+    comp = zlib.compressobj(9, zlib.DEFLATED, -15)
+    datos = base64.b64encode(comp.compress(urllib.parse.quote(xml).encode()) + comp.flush()).decode()
+    (c / "diagramas" / "UPPER.DRAWIO").write_text(f'<mxfile><diagram id="d">{datos}</diagram></mxfile>')
+    raiz = Path(__file__).resolve().parents[2]
+    r = subprocess.run([sys.executable, "-I", str(raiz / "anonimizar" / "anonimizar.py"), "--termino", "acme", str(c)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "Verificación OK" in r.stdout, r.stdout + r.stderr
+    anon = tmp_path / "salida" / "2026-10-18T194232Z-anon"
+    assert "2026-10-18T194232Z" in (anon / "informe-finops.md").read_text()      # el run_id queda tal cual
+    diag = next(anon.rglob("*.DRAWIO")).read_text()
+    assert "123456789012" not in diag and "acme" not in diag.lower()
+
+
+def test_cargar_json_rechaza_infinitos_y_enteros_gigantes():
+    import pytest
+    from common.verificacion import cargar_json
+    for malo in ('{"a": 1e999}', '{"a": NaN}', '{"a": -Infinity}', '{"a": ' + "9" * 40 + '}', "[" * 100000):
+        with pytest.raises(ValueError):
+            cargar_json(malo)
+    assert cargar_json('{"a": 1.5, "b": 12}') == {"a": 1.5, "b": 12}

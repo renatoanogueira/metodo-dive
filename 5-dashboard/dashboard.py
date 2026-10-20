@@ -38,6 +38,7 @@ sys.path.insert(0, str(AQUI))
 
 import base  # noqa: E402
 from common import cargar_config  # noqa: E402  (también fija el umask 077: la base queda solo para el usuario)
+from common.verificacion import leer_en_carpeta  # noqa: E402
 
 WEB = AQUI / "web"
 ESTATICOS = {"/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -52,6 +53,7 @@ CSP_APP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'se
 # dentro del dashboard.
 CSP_REPORTE = ("sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
                "img-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'self'")
+MAX_REPORTE = 200_000_000  # bytes: un reporte.html de miles de recursos puede pesar decenas de MB
 VIDA_TICKET = 30  # segundos de un ticket de un solo uso para abrir un reporte en el iframe
 
 
@@ -90,8 +92,11 @@ def crear_handler(db, carpetas, token, puerto):
                 self.wfile.write(cuerpo)
 
         def _json(self, datos, codigo=200):
-            self._enviar(codigo, json.dumps(datos, ensure_ascii=False, default=str).encode(),
-                         "application/json; charset=utf-8")
+            try:  # allow_nan=False: un Infinity no es JSON válido y rompe el panel; mejor un error claro
+                cuerpo = json.dumps(datos, ensure_ascii=False, default=str, allow_nan=False).encode()
+            except ValueError:
+                return self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "Datos con un número no finito (NaN/Infinity)")
+            self._enviar(codigo, cuerpo, "application/json; charset=utf-8")
 
         def _error(self, codigo, msg):
             self._enviar(codigo, msg.encode())
@@ -159,10 +164,12 @@ def crear_handler(db, carpetas, token, puerto):
                 carpeta = base.carpeta_de(con, run_id)
             finally:
                 con.close()
-            ruta = carpeta / "reporte.html" if carpeta else None
-            if not ruta or not ruta.is_file():
-                return self._error(HTTPStatus.NOT_FOUND, "Esa corrida no tiene reporte.html")
-            return self._enviar(200, ruta.read_bytes(), "text/html; charset=utf-8", csp=CSP_REPORTE)
+            # Sin seguir symlinks ni hardlinks: lo servido es el reporte de la corrida, no otro archivo.
+            crudo = leer_en_carpeta(carpeta, "reporte.html", MAX_REPORTE) if carpeta else None
+            if crudo is None:
+                return self._error(HTTPStatus.NOT_FOUND, "reporte.html no existe o no se puede servir "
+                                   "(symlink, hardlink, no es un archivo regular o pesa más de 200 MB)")
+            return self._enviar(200, crudo, "text/html; charset=utf-8", csp=CSP_REPORTE)
 
         def _api_get(self, ruta, q):
             con = base.conectar(db)
@@ -184,6 +191,13 @@ def crear_handler(db, carpetas, token, puerto):
                     return self._json(datos) if datos else self._error(HTTPStatus.NOT_FOUND, "Corrida desconocida")
                 if ruta == "/api/hallazgos":
                     return self._json(base.hallazgos(con, org, run))
+                if ruta == "/api/insights":
+                    datos = base.insights(con, org, run, cuenta) if RE_RUN_ID.fullmatch(run) else None
+                    return self._json(datos) if datos else self._error(HTTPStatus.NOT_FOUND, "Corrida desconocida")
+                if ruta == "/api/informe":
+                    texto = base.informe(con, org, run) if RE_RUN_ID.fullmatch(run) else None
+                    return self._json({"texto": texto, "actual": base.informe_actual(con, run, texto)}) if texto is not None else \
+                        self._error(HTTPStatus.NOT_FOUND, "Esa corrida no tiene informe-finops.md")
                 return self._error(HTTPStatus.NOT_FOUND, "No existe")
             finally:
                 con.close()

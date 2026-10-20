@@ -190,3 +190,17 @@ def recurso(account_id, region, service, type, id, arn=None, name=None, state=No
         "attrs": attrs or {},
         "relations": {k: v for k, v in (relations or {}).items() if v},
     }
+
+
+def moneda_de_pago(discovery):
+    """discovery.finops.moneda_pago si tiene forma válida y no es USD; si no, None. Los montos de DIVE son USD:
+    esto es solo para mostrar el equivalente en la moneda en que se paga la factura."""
+    m = ((discovery or {}).get("finops") or {}).get("moneda_pago") if isinstance(discovery, dict) else None
+    if (not isinstance(m, dict) or not isinstance(m.get("codigo"), str)
+            or not re.fullmatch(r"[A-Z]{3}", m["codigo"]) or m["codigo"] == "USD"):
+        return None
+    tasa = m.get("tasa")
+    if not isinstance(tasa, (int, float)) or isinstance(tasa, bool) or not 0 < tasa < 1e6:
+        return None
+    return {"codigo": m["codigo"], "tasa": tasa, "periodo": m.get("periodo") if isinstance(m.get("periodo"), str) else None,
+            "fuente": m.get("fuente") if m.get("fuente") in ("invoice", "config") else None}

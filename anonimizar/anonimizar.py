@@ -37,6 +37,16 @@ AQUI = Path(__file__).resolve().parent
 sys.path.insert(0, str(AQUI.parent))
 
 from common import RAIZ, cargar_config  # noqa: E402
+from common.verificacion import leer_archivo_seguro  # noqa: E402
+
+MAX_ARCHIVO_CORRIDA = 500_000_000  # bytes
+
+
+def leer_texto_seguro(ruta):
+    """Texto de un archivo de la corrida, o None si es un symlink, un hardlink, no es un archivo regular o es
+    enorme. Un archivo que apunta a otro (ej. ~/.aws/credentials) nunca se lee ni se copia a la versión anónima."""
+    crudo = leer_archivo_seguro(ruta, MAX_ARCHIVO_CORRIDA)
+    return crudo.decode("utf-8", errors="replace") if crudo is not None else None
 
 TEXTO = {".json", ".md", ".drawio", ".xml", ".html", ".htm", ".txt", ".csv", ".svg", ".yaml", ".yml", ".log"}
 MAPEO_NOMBRE = "anon.mapping.json"
@@ -135,6 +145,9 @@ RE_TOKEN_ARN = re.compile(r"(?<=[/:_.])([0-9A-Za-z]{16,})(?=$|[/:_.-])")
 RE_COSTO = re.compile(r"(\$\s?)(\d(?:[\d,]*\d)?(?:\.\d+)?)|(?<![\w.,])(\d(?:[\d,]*\d)?(?:\.\d+)?)(\s?USD\b)")
 # \w acotado: sin tope es cuadrático en secuencias largas de letras.
 RE_COSTO_CLAVE = re.compile(r"([\"']?)(\w{0,64}(?:usd|cost|costo)\w{0,64})\1(\s*:\s*)(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+# Precio unitario que las reglas de la fase 3 citan ("precio 0.088 USD/GB-mes", "0.11 → 0.088 USD/GB-mes"):
+# con los GiB u horas del mismo texto permite recalcular el costo, así que se oculta si costs no es exact.
+RE_PRECIO_UNITARIO = re.compile(r"(?<![\w.,])\d+(?:\.\d+)?(?:\s*→\s*\d+(?:\.\d+)?)?\s?USD/(GB-mes|hora)\b")
 RE_MENSUAL = re.compile(r"^\s*(?:USD\s*)?(?:/\s*mes|/\s*month|/\s*mo\b|al mes|por mes|mensual|per month)",
                         re.IGNORECASE)
 RE_CLAVE_COSTO = re.compile(r"usd|cost|costo", re.IGNORECASE)
@@ -183,6 +196,7 @@ class IndicePrefijos:
 
 
 # Acotado a 255: sin tope, una línea larga sin "…" es cuadrática (40k caracteres tardaban ~5 s).
+RE_FECHA_EN = re.compile(r"(?<![0-9])(\d{4}-\d{2}-\d{2}(?:T\d{1,6}Z?)?)(?![0-9])")
 RE_TRUNCADO = re.compile(r"([A-Za-z0-9][A-Za-z0-9!_./:-]{0,255})(?=…)")
 
 
@@ -494,7 +508,15 @@ class Anonimizador:
         return base64.b64encode(self.uuid(u).encode()).decode()
 
     def _compuesto_sub(self, m):
-        partes = re.split(r"([-_!])", m.group(0))
+        # Una fecha ISO o un run_id (2026-10-18T194232Z, 2026-10-18T19 de "…T19:42:00Z") no es un nombre de
+        # recurso: su "último segmento" parece aleatorio pero es la hora. Tratarlo como token rompía la
+        # verificación (el run_id de los JSON se conserva tal cual). También dentro de un nombre más largo
+        # (<run_id>-anon, db-<fecha>): la fecha queda tal cual y solo se mira el resto.
+        piezas = RE_FECHA_EN.split(m.group(0))  # con grupo: las posiciones impares son las fechas
+        return "".join(p if i % 2 else self._compuesto_partes(p) for i, p in enumerate(piezas))
+
+    def _compuesto_partes(self, texto):
+        partes = re.split(r"([-_!])", texto)
         for i in range(0, len(partes), 2):
             seg = partes[i]
             if seg.lower() in self.mp.seg_falsos or not es_aleatorio(seg, ultimo=i == len(partes) - 1):
@@ -616,6 +638,8 @@ class Anonimizador:
                 return m.group(0)
             return f"{m.group(1)}{m.group(2)}{m.group(1)}{m.group(3)}{r[1]}"
 
+        if self.costos != "exact":
+            texto = RE_PRECIO_UNITARIO.sub(lambda m: f"USD/{m.group(1)} de lista", texto)
         texto = RE_COSTO.sub(sub, texto)
         return RE_COSTO_CLAVE.sub(sub_clave, texto)
 
@@ -668,7 +692,8 @@ class Anonimizador:
             t = self.re_terminos.sub(lambda m: con_caja(m.group(0), self.terminos[m.group(0).lower()]), t)
         return t
 
-    CATS_FINAL = ("token", "cdk", "uuid", "access_key", "resource_id")  # la última gana si se repite
+    # La última gana si se repite. fingerprint va al final: los insights los citan dentro de texto ("finding:<fp>...").
+    CATS_FINAL = ("token", "cdk", "uuid", "access_key", "resource_id", "fingerprint")
 
     def congelar(self):
         """Compila todo lo aprendido en la primera pasada. La pasada final reemplaza cualquier valor
@@ -754,10 +779,15 @@ class Anonimizador:
                 k2 = self.texto(k, costos=False) if isinstance(k, str) else k
                 if isinstance(k, str) and isinstance(v, str) and RE_CLAVE_PERSONA.match(k):
                     salida[k2] = self.persona(v)
+                elif isinstance(k, str) and RE_CLAVE_PERSONA.match(k) and isinstance(v, list) \
+                        and all(isinstance(x, str) for x in v):
+                    salida[k2] = [self.persona(x) for x in v]  # lista de nombres (ej. usuarios de una salida de AWS)
                 elif k == "run_id" and isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}(T\d{6}Z)?", v):
                     salida[k2] = v
                 elif k == "fingerprint" and isinstance(v, str):
                     salida[k2] = self.huella(v)
+                elif k == "fingerprints" and isinstance(v, list) and all(isinstance(x, str) for x in v):
+                    salida[k2] = [self.huella(x) for x in v]  # insights.json: alcance.fingerprints
                 elif k == "org_alias" and isinstance(v, str):
                     salida[k2] = self.org_alias(v)
                 elif (k == "name" and len(ruta) >= 2 and ruta[-2] == "accounts" and isinstance(v, str)) \
@@ -814,8 +844,9 @@ def descomprimir_diagrama(b64):
 
 # --------------------------------------------------------------------------- preescaneo
 
-def preescanear(archivos):
-    """Junta cuentas (id→nombre), costo total, meses e IDs de recurso "raros" de los JSON."""
+def preescanear(archivos, contenidos=None):
+    """Junta cuentas (id→nombre), costo total, meses e IDs de recurso "raros" de los JSON. `contenidos`
+    ({ruta: texto}, ya leídos de forma segura) evita volver a leer del disco."""
     cuentas, tokens, total, meses = {}, set(), None, None
 
     def recorrer(o, ruta=()):
@@ -839,11 +870,14 @@ def preescanear(archivos):
                 recorrer(v, ruta)
 
     for ruta in archivos:
-        if ruta.suffix != ".json":
+        if ruta.suffix.lower() != ".json":
             continue
+        texto = contenidos.get(ruta) if contenidos is not None else leer_texto_seguro(ruta)
         try:
-            datos = json.loads(ruta.read_text())
-        except (ValueError, UnicodeDecodeError):
+            datos = json.loads(texto) if texto is not None else None
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            continue
+        if datos is None:
             continue
         recorrer(datos)
         if ruta.name == "discovery.json" and isinstance(datos.get("accounts"), dict):
@@ -856,11 +890,22 @@ def preescanear(archivos):
 
 def contenido_verificable(ruta):
     t = ruta.read_text(errors="replace")
-    if ruta.suffix in (".drawio", ".xml"):
+    if ruta.suffix.lower() in (".drawio", ".xml"):
         extra = [descomprimir_diagrama(m.group(2).strip()) for m in RE_DIAGRAMA.finditer(t)
                  if m.group(2).strip() and not m.group(2).strip().startswith("<")]
         t += "\n" + "\n".join(x for x in extra if x)
     return t
+
+
+def _por_enlace(base, p):
+    """¿p es un symlink o cuelga de una carpeta symlink dentro de base? Un archivo de la corrida que apunta a otro
+    (ej. ~/.aws/credentials) no se lee ni se copia a la versión para compartir."""
+    actual = Path(p)
+    while actual != base and actual != actual.parent:
+        if actual.is_symlink():
+            return True
+        actual = actual.parent
+    return False
 
 
 def verificar(carpeta, mapeo, terminos, dominios_publicos=(), privadas=False):
@@ -901,8 +946,11 @@ def verificar(carpeta, mapeo, terminos, dominios_publicos=(), privadas=False):
     prefijos = IndicePrefijos({r.lower(): None for c in ("resource_id", "uuid", "token", "cdk", "access_key")
                                for r in mapeo.m[c] if len(r) >= 8})
 
-    for ruta in sorted(p for p in carpeta.rglob("*") if p.is_file()):
+    for ruta in sorted(p for p in carpeta.rglob("*") if p.is_file() or p.is_symlink()):
         rel = ruta.relative_to(carpeta)
+        if _por_enlace(carpeta, ruta):
+            problemas.append((rel, "symlink en la carpeta anónima", ruta.name))
+            continue
         if ruta.name.endswith(".mapping.json"):
             problemas.append((rel, "archivo de mapeo dentro de la carpeta anónima", ruta.name))
             continue
@@ -1078,16 +1126,45 @@ def main(argv=None):
         return 2
     if origen.name.endswith("-anon"):
         raise SystemExit("Esa carpeta ya es anónima; pasa la carpeta original salida/<corrida>.")
+    # El mapeo (con la sal) es la llave para des-anonimizar: nunca se lee ni se escribe a través de un link
+    # (el chequeo va antes de resolver(), que seguiría el link).
+    if args.mapping and Path(args.mapping).expanduser().is_symlink():
+        raise SystemExit(f"{args.mapping} es un symlink: no se usa como mapeo.")
     ruta_mapeo = resolver(args.mapping) if args.mapping else origen / MAPEO_NOMBRE
-    mapeo = Mapeo(json.loads(ruta_mapeo.read_text()) if ruta_mapeo.exists() else None)
+    if ruta_mapeo.is_symlink():
+        raise SystemExit(f"{ruta_mapeo} es un symlink: no se usa como mapeo.")
+    crudo_mapeo = None
+    if os.path.lexists(ruta_mapeo):
+        crudo_mapeo = leer_texto_seguro(ruta_mapeo)  # una sola lectura: lo comprobado es lo que se usa
+        if crudo_mapeo is None:
+            raise SystemExit(f"{ruta_mapeo} es un hardlink, un FIFO o no es un archivo regular: no se usa.")
+    mapeo = Mapeo(json.loads(crudo_mapeo) if crudo_mapeo is not None else None)
     destino = origen.parent / f"{origen.name}-anon"
     if destino.exists():
         shutil.rmtree(destino)
     destino.mkdir(parents=True)
 
-    archivos = sorted(p for p in origen.rglob("*") if p.is_file() and not p.name.endswith(".mapping.json")
-                      and p.name != ".DS_Store")
-    cuentas, tokens, total, meses = preescanear(archivos)
+    enlaces = sorted(p for p in origen.rglob("*") if _por_enlace(origen, p))
+    for p in enlaces:
+        print(f"AVISO: {p.relative_to(origen)} es un symlink (o está bajo uno): no se copia.", file=sys.stderr)
+    for p in sorted(p for p in origen.rglob("*") if not _por_enlace(origen, p) and not p.is_file() and not p.is_dir()):
+        print(f"AVISO: {p.relative_to(origen)} no es un archivo regular (FIFO, socket…): no se copia.", file=sys.stderr)
+    candidatos = sorted(p for p in origen.rglob("*") if p.is_file() and not _por_enlace(origen, p)
+                        and not p.name.endswith(".mapping.json") and p.name != ".DS_Store")
+    # Cada archivo se lee una vez, sin seguir links: lo que se anonimiza y copia es exactamente lo leído aquí.
+    contenidos, archivos = {}, []
+    for p in candidatos:
+        if p.suffix.lower() not in TEXTO:
+            archivos.append(p)  # binario: se omite más abajo con aviso
+            continue
+        texto = leer_texto_seguro(p)
+        if texto is None:
+            print(f"AVISO: {p.relative_to(origen)} no se copia: es un hardlink, no es un archivo regular o es enorme.",
+                  file=sys.stderr)
+            continue
+        contenidos[p] = texto
+        archivos.append(p)
+    cuentas, tokens, total, meses = preescanear(archivos, contenidos)
     costos = args.costos or cfg.get("costs") or "rounded"
     if costos == "percent" and not total:
         print("AVISO: costs=percent sin discovery.json con total; se usa rounded.", file=sys.stderr)
@@ -1111,24 +1188,34 @@ def main(argv=None):
                 if escribir:
                     omitidos.append(rel)
                 continue
-            contenido = ruta.read_text(errors="replace")
-            if ruta.suffix == ".json":
+            contenido = contenidos[ruta]
+            if ruta.suffix.lower() == ".json":
                 try:
                     datos = an.json(json.loads(contenido))
+                    # Salida del runner (aws/A###.json): el hash cubre la salida ya anonimizada, o la copia no validaría.
+                    if isinstance(datos, dict) and isinstance(datos.get("salida"), str) and "sha256" in datos:
+                        datos["sha256"] = hashlib.sha256(datos["salida"].encode()).hexdigest()
                     if costos != "exact" and isinstance(datos, dict):
                         datos["anonymized"] = {"costs": costos}
                     resultado = json.dumps(datos, indent=2, ensure_ascii=False) + "\n"
-                except ValueError:
+                except (ValueError, RecursionError):
                     resultado = an.texto(contenido)
             else:
-                resultado = an.drawio(contenido) if ruta.suffix in (".drawio", ".xml") else an.texto(contenido)
+                resultado = an.drawio(contenido) if ruta.suffix.lower() in (".drawio", ".xml") else an.texto(contenido)
             if escribir:
                 salida = destino / rel_anon
                 salida.parent.mkdir(parents=True, exist_ok=True)
                 salida.write_text(resultado)
 
-    ruta_mapeo.write_text(json.dumps(mapeo.a_dict(), indent=2, ensure_ascii=False) + "\n")
-    ruta_mapeo.chmod(0o600)  # el mapeo (con la sal) es la llave para des-anonimizar
+    # Archivo nuevo (O_EXCL, sin seguir links) y reemplazo atómico: si alguien cambió el mapeo por un symlink, un
+    # hardlink o un FIFO mientras corría, la sal no se escribe en otro archivo ni el proceso se queda bloqueado.
+    # Termina en .mapping.json: si el proceso muere a medias, el temporal (con la sal) tampoco se copia ni se versiona.
+    tmp = ruta_mapeo.with_name(f".tmp-{os.getpid()}.{ruta_mapeo.name}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(mapeo.a_dict(), indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, ruta_mapeo)
     print(f"Anonimizado: {len(archivos) - len(omitidos)} archivo(s) → {destino}")
     print(f"Mapeo: {ruta_mapeo}")
     for rel in omitidos:

@@ -194,7 +194,7 @@ def test_validar_completo(tmp_path, monkeypatch):
     datos = json.loads((tmp_path / "findings.json").read_text())
     assert set(datos) >= {"generated_at", "findings"}
     claves = {"id", "category", "severity", "account_id", "region", "resource_id", "title", "detail",
-              "rule_id", "issue_id", "fingerprint", "price_source", "is_saving",
+              "rule_id", "issue_id", "fingerprint", "price_source", "confidence", "is_saving",
               "monthly_usd", "source"}
     assert all(set(f) == claves for f in datos["findings"])
     assert {f["source"] for f in findings} == {"aws-doctor", "cruce-billing", "regla"}
@@ -207,8 +207,9 @@ def test_validar_completo(tmp_path, monkeypatch):
     # vol-0001 lo marcan aws-doctor y la regla (desperdicio): queda uno solo, el de aws-doctor.
     vol = [f for f in findings if f["resource_id"] == "vol-0001" and f["category"] == "desperdicio"]
     assert len(vol) == 1 and vol[0]["source"] == "aws-doctor"
-    # gp2→gp3 (costo) sobre un volumen que ya es desperdicio se descarta: el ahorro no se cuenta dos veces.
-    assert not any(f["resource_id"] == "vol-0001" and f["category"] == "costo" for f in findings)
+    # gp2→gp3 (costo) sobre un volumen que ya es desperdicio queda, pero no suma: el ahorro no se cuenta dos veces.
+    costo = [f for f in findings if f["resource_id"] == "vol-0001" and f["category"] == "costo"]
+    assert len(costo) == 1 and costo[0]["is_saving"] is False
 
     md = (tmp_path / "findings.md").read_text()
     assert "## Severidad alta" in md and "Produccion (111111111111)" in md and "sg-0001" in md

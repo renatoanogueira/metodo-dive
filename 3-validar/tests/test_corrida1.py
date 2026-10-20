@@ -227,8 +227,9 @@ def test_deduplicar_usa_region_y_descarta_costo_de_un_desperdicio():
                 _f("riesgo", "eu-west-1", "vol-1", None),
                 _f("costo", None, None, 1.0, "regla.a"), _f("costo", None, None, 1.0, "regla.b")]  # agregados distintos
     salida = validar.deduplicar(findings)
-    assert [(f["category"], f["region"]) for f in salida] == [
-        ("desperdicio", "eu-west-1"), ("costo", "us-east-1"), ("riesgo", "eu-west-1"), ("costo", None), ("costo", None)]
+    assert [(f["category"], f["region"], f["is_saving"]) for f in salida] == [
+        ("desperdicio", "eu-west-1", True), ("costo", "eu-west-1", False), ("costo", "us-east-1", True),
+        ("riesgo", "eu-west-1", False), ("costo", None, True), ("costo", None, True)]
 
 
 # ---------- D · campos que las reglas esperaban ----------
@@ -495,7 +496,8 @@ def test_un_ahorro_por_recurso_entre_issues_distintos():
     desp_despues = hallazgo("desperdicio", "media", CUENTA, REGION, "vol-1", "sin adjuntar", "d", 8.0, "regla",
                             rule_id="regla.ebs_sin_adjuntar")
     salida = validar.deduplicar([doc, regla, riesgo, costo_antes, desp_despues])
-    assert [f["rule_id"] for f in salida] == ["aws-doctor.orphaned_snapshots", "regla.x", "regla.ebs_sin_adjuntar"]
+    assert [f["rule_id"] for f in salida] == ["aws-doctor.orphaned_snapshots", "regla.x", "regla.gp2",
+                                              "regla.ebs_sin_adjuntar"]
     assert sum(f["monthly_usd"] or 0 for f in salida if f["is_saving"]) == 10.0
 
 

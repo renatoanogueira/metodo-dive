@@ -30,6 +30,8 @@ def collect(session, region, account_id):
                 "instance_id": a.get("InstanceId"),
                 "network_interface_id": a.get("NetworkInterfaceId"),
                 "public_ipv4_pool": a.get("PublicIpv4Pool"),
+                # alb, nlb, rds…: IP que asigna y gestiona un servicio de AWS; no se puede liberar.
+                "service_managed": a.get("ServiceManaged"),
             },
             relations={"attached_to": [destino] if destino else []},
         ))
